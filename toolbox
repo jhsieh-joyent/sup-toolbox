@@ -1,0 +1,1991 @@
+TB_VERSION=4.4.6
+TB_VERSION_NAME="It's Wednesday, this must be Devon"
+TB_VERSION_DATE="20161116"
+TB_RECENT_CHANGES="
+Replaced sdc-ldap/ufds with OpenLDAP client
+vm/vmi now shows Swap
+Moved creds to environment
+Added random element to disabler string
+fraud() speed up
+Added over() for PD overrides
+Added RAM to vms_by_pkg / fraud
+Added dates to cust()
+Big speed up for cust_vms(). You are welcome.
+"
+if [ "$(echo $BASH_SOURCE | cut -c 1)" == "/" ]; then
+   TOOLBOX=$BASH_SOURCE
+else
+   TOOLBOX=$PWD/$BASH_SOURCE
+fi
+mkdir -p $(dirname $TOOLBOX)/.log
+
+set -a 
+
+
+LDAP_OPTS="-H $UFDS_URL -x -D $UFDS_DN -w $UFDS_PASSWORD"
+LDAP_S_OPTS="$LDAP_OPTS -o ldif-wrap=no -LLL -b o=smartdc"
+export LDAPTLS_REQCERT=allow
+
+CURR_USER=""
+
+while [ ! "$CURR_USER" ]
+do
+   read -p "Enter your $CLOUD Headnode username: " CURR_USER
+done
+
+ver()
+#:- ver |Display toolbox version
+{
+cat << !
+Toolbox - Version $TB_VERSION - $TB_VERSION_NAME ($TB_VERSION_DATE)
+---- Recent Changes ----
+$TB_RECENT_CHANGES
+------------------------
+!
+}
+
+ver
+
+ldap_to_json()
+#:- ldap_to_json |Converts simple ldap output to a single json object. No frills here
+{
+
+C=""
+E=0
+F=0
+{
+echo "[{"
+while read LKEY LREST
+do
+	LKEY=$(echo $LKEY | cut -d: -f1)
+	if [ ! "$LKEY" ] ; then
+		echo "}"
+		E=1
+		F=1
+	else
+		echo $C'"'$LKEY'": "'$LREST'"'
+		C=","
+	fi
+	if [ $F -eq 1 ] ; then
+		C=",{"
+		F=0
+        fi
+done
+if [ $E -eq 0 ]; then
+	echo "}]"
+else
+	echo "]"
+fi
+} | json -a
+
+
+}
+
+call_api()
+#:- call_api :az :api :path :options |generic api interface
+{
+aud $@
+AZ=$(valid_dc $1) || ( echo "Invalid DC name - Valid names are $AZS" && false ) || return
+API=$2
+shift 2
+
+unset IFS
+unset UNIX95
+
+eval URL=\$${AZ}_$API
+
+CURL_OPTS="-4 --connect-timeout 10 -sS -i -H accept:application/json -H content-type:application/json"
+
+path=$1
+shift
+
+curl ${CURL_OPTS} -H "accept-version: *" --url "${URL}${path}" \
+        "$@"  | json || return $?
+echo ""  # sometimes the result is not terminated with a newline
+return 0
+}
+
+api_call()
+{
+AZ=$2
+API=$1
+
+shift 2
+
+call_api $AZ $API $@
+}
+
+alias vmapi="api_call VMAPI"
+alias capi="api_call CAPI"
+alias cnapi="api_call CNAPI"
+alias napi="api_call NAPI"
+alias imgapi="api_call IMGAPI"
+alias fwapi="api_call FWAPI"
+alias papi="api_call PAPI"
+
+fingerprint_search ()
+#:- fingerprint_search :fingerprint |Lists users with an ssh key matching the fingerprint
+{
+aud $@
+   for UUID in `ldapsearch $LDAP_S_OPTS "(&(objectclass=sdckey)(fingerprint=$1))" | ldap_to_json | json -gaH dn | /usr/bin/cut -d '=' -f 3 | /usr/bin/cut -d , -f 1`
+   do
+   ldapsearch $LDAP_S_OPTS "(&(objectclass=sdcperson)(uuid=$UUID))" | ldap_to_json | json -aH uuid login email approved
+   done | tee /tmp/$$.fp.vms
+
+   if [ "$2" = "D" ]; then
+      cat /tmp/$$.fp.vms | sed 's/ .*//' | sed -e 's/^/disabler /' > /tmp/$$.fp.vms.2
+      . /tmp/$$.fp.vms.2
+   fi
+}
+
+fp_search_active ()
+#:- fp_search_active :fingerprint |Lists users with an ssh key matching the fingerprint that are approved for provisioning
+{
+aud $@
+   for UUID in `ldapsearch $LDAP_S_OPTS "(&(objectclass=sdckey)(fingerprint=$1))" | ldap_to_json | json -gaH dn | /usr/bin/cut -d '=' -f 3 | /usr/bin/cut -d , -f 1`
+   do
+   ldapsearch $LDAP_S_OPTS "(&(objectclass=sdcperson)(uuid=$UUID)(approved_for_provisioning=true))" | ldap_to_json | json -aH uuid login email approved
+   done | tee /tmp/$$.fp.vms
+
+   if [ "$2" = "D" ]; then
+      cat /tmp/$$.fp.vms | sed 's/ .*//' | sed -e 's/^/disabler /' > /tmp/$$.fp.vms.2
+      . /tmp/$$.fp.vms.2
+   fi
+}
+
+fp_vms ()
+#:- fp_vms :fingerprint |list VMs for users who's ssh key matches the fingerprint
+{
+aud $@
+   for UUID in `ldapsearch $LDAP_S_OPTS "(&(objectclass=sdckey)(fingerprint=$1))" | ldap_to_json | json -gaH dn | /usr/bin/cut -d '=' -f 3 | /usr/bin/cut -d , -f 1`
+   do
+      echo $UUID
+      cust_vms $UUID $2
+   done | \
+                awk '{print $0
+                      if ( $1 == ">") {V+=1;R+=$4}
+                     }
+                     END {if (V > 0) {print "V="V", R="R/1024" GB"}}'
+}
+
+email_search ()
+#:- email_search :email_address |List accounts matching the email address. Accepets * as wild card
+{
+aud $@
+   for UUID in `ldapsearch $LDAP_S_OPTS "(&(objectclass=sdcperson)(email=$1))" | ldap_to_json | json -aHg uuid`
+   do
+   ldapsearch $LDAP_S_OPTS "(&(objectclass=sdcperson)(uuid=$UUID))" | ldap_to_json | json -aHg uuid login email approved
+   done | tee /var/tmp/.$$.ems | column -t
+   if [ ! -s /var/tmp/.$$.ems ] ; then
+      echo "Not found in $CLOUD"
+      return 1
+   fi
+}
+
+tel ()
+{
+aud $@
+   for UUID in `ldapsearch $LDAP_S_OPTS "(&(objectclass=sdcperson)(phone=$1))" | ldap_to_json | json -gaH uuid`
+   do
+   ldapsearch $LDAP_S_OPTS "(&(objectclass=sdcperson)(uuid=$UUID))" | ldap_to_json | json -aH 'uuid login phone email approved'
+   done
+}
+
+alias zone_cpu="p prctl -n zone.cpu-cap -i zone"
+alias io_throttle="vfsstat 1 5"
+alias fp_search="fingerprint_search"
+alias em_search="email_search"
+
+function job_q ()
+#:- job_q :dc |List queued and running jobs
+{
+aud $@
+   AZ=$(valid_dc $1) || ( echo "Invalid DC name - Valid names are $AZS" && false ) || return
+   echo QUEUED
+   workflow $AZ "/jobs?execution=queued&offset=0&limit=20000" | json -aH execution name | awk '{T[$2]+=1;t+=1} END {for (i in T) {print T[i],i} {print t}}'
+   echo
+   echo RUNNING
+   workflow $AZ "/jobs?execution=running&offset=0&limit=5000" | json -aH execution name | awk '{T[$2]+=1;t+=1} END {for (i in T) {print T[i],i} {print t}}'
+}
+
+fraud ()
+#:- fraud [m] [N]| List possible fraud VM's for this Month (m) or today and the previous N days
+{
+aud $@
+
+SCOPE=${1:-"m"}
+
+if [ "$SCOPE" = "m" ]; then
+   FILTER=$(date +%Y-%m-)
+else
+   typeset -i DAYS=$(echo $SCOPE | egrep "^[0-9][0-9]*$")
+   [ "$DAYS" = "" ] && echo invalid number of days && return
+   P=""
+   FILTER=""
+   while [ $DAYS -ge 0 ]
+   do
+      FILTER=$FILTER"$P$(/opt/local/bin/date --date="-$DAYS days" +%Y-%m-%d)"
+      P="|"
+      DAYS=DAYS-1
+   done
+fi
+
+echo $FILTER
+
+(
+vms_by_pkg "*64*" | egrep "ALIAS|$FILTER"
+vms_by_pkg "*31.75*" | egrep "$FILTER"
+vms_by_pkg "*32*" | egrep "$FILTER"
+vms_by_pkg "*15.75*" | egrep "$FILTER"
+vms_by_pkg "*7.75*" | egrep "$FILTER"
+) | column -t
+
+}
+
+keys ()
+#:- keys :uuid or :email |List customers SSH keys
+{
+aud $@
+
+   UUID=""
+   if [ "$1" ]; then
+      UUID=$(get_uuid $1)
+      [ ! "$UUID" ] && echo "No UUID" && return
+   fi
+
+UUID=${UUID:-$_TB_OWNER}
+export CUST=$UUID
+
+[ ! "$UUID" ] && echo "Usage: keys UUID [+]" && return
+
+call_api $UFDS_MASTER CAPI /customers/$UUID/keys | json -aH fingerprint body | fold -w ${COLUMNS:-132}
+
+}
+
+cust_nets ()
+#:- cust_nets :uuid or :email |List customers Networks in all DC's
+{
+aud $@
+
+   UUID=""
+   if [ "$1" ]; then
+      UUID=$(get_uuid $1)
+      [ ! "$UUID" ] && echo "No UUID" && return
+   fi
+
+UUID=${UUID:-$_TB_OWNER}
+export CUST=$UUID
+
+[ ! "$UUID" ] && echo "Usage: cust_nets UUID " && return
+
+{ echo DC NAME NIC_TAG SUBNET
+for dc in $AZS
+do
+   napi $dc /networks?owner_uuid=$CUST | json -aH name nic_tag subnet | sort | prefix $dc
+done
+} | column -t
+}
+
+cust_vms ()
+#:- cust_vms :uuid or :email |List customers VM's in all DC's
+{
+aud $@
+   UUID=""
+   if [ "$1" ]; then
+      UUID=$(get_uuid $1)
+      [ ! "$UUID" ] && echo "No UUID" && return
+   fi
+
+UUID=${UUID:-$_TB_OWNER}
+export CUST=$UUID
+
+[ ! "$UUID" ] && echo "Usage: cust_vms UUID [+]" && return
+
+call_api $UFDS_MASTER CAPI /customers/$UUID | json -aH login email_address
+call_api $UFDS_MASTER CAPI /customers/$UUID/keys | json -aH fingerprint body | fold -w ${COLUMNS:-132}
+
+QUERY="(%26(owner_uuid=$UUID)(|(state=running)(state=stopped)(state=stopping)))"
+
+STOP=""
+DEL=""
+CN=""
+
+if [ "$2" = "+" ]; then
+   QUERY="(owner_uuid=$UUID)"
+elif [ "$2" = "X" ]; then
+   DEL=true
+elif [ "$2" = "S" ]; then
+   STOP=true
+elif [ "$2" = "CN" ]; then
+   CN=true
+fi
+
+TFILE=/var/tmp/cvms.$$
+JSON=/var/tmp/.$$.cust_vms
+PRIM=/var/tmp/.$$.cust_vms.prim
+rm -f $TFILE
+{
+echo DC ALIAS DK PACKAGE RAM CREATED UUID BRAND STATE PRIMARY HOST
+for dc in $AZS
+do
+   if [ "$DEL" = "true" ]; then
+      call_api $dc VMAPI "/vms?query=$QUERY" | json -aH uuid |\
+      while read uuid
+      do
+         call_api $dc VMAPI /vms/$uuid -X DELETE | json -H
+      done
+   elif [ "$STOP" = "true" ]; then
+      call_api $dc VMAPI "/vms?query=$QUERY" | json -aH alias uuid state |\
+      while read alias uuid state
+      do
+         echo $alias $uuid $state
+         [ "$state" = "running" ] && call_api $dc VMAPI /vms/$uuid?action=stop -X POST | json -H
+      done
+    else
+      call_api $dc VMAPI "/vms?query=$QUERY" > $JSON
+      cat $JSON | json -aH uuid nics.0.ip nics.0.primary nics.1.ip nics.1.primary > $PRIM
+      cat $JSON | \
+		 json -e 'this.billing_id = this.billing_id + ""' | \
+                 sed -e '/billing_id/ s/ /_/g' -e '/billing_id/ s/:_/: /' -e '/billing_id/ s/____/    /' | sed -e 's/__"pack/  "pack/' | \
+		 json -aH alias billing_id ram create_timestamp uuid brand state server_uuid docker | \
+                 while read ALIAS PACKAGE RAM CREATE UUID BRAND STATE SERVER DOCKER
+                 do
+                    if [ "$CN" = "true" ]; then
+                       HOST=`call_api $dc CNAPI /servers/$SERVER | json -aH hostname`
+                    else
+                       HOST=""
+                    fi
+		    [ "$DOCKER" = "true" ] && DOCKER="Y" || DOCKER="-"
+                    PRIMARY=$(grep $UUID $PRIM | /usr/bin/cut -d'true' -f 1 | awk '{print $NF}')
+                    echo $dc $ALIAS $DOCKER $PACKAGE $RAM $CREATE $UUID $BRAND $STATE $PRIMARY $HOST
+                done | \
+                  awk  -v TFILE=$TFILE '{V+=1;R+=$5;print $0}
+                              END {if (V > 0) {print "VMs="V" Ram="R/1024"gb"; print ""; print V,R >> TFILE}}'
+    fi
+
+done 
+} | column -t
+[ -s $TFILE ] && awk '{V+=$1; R+=$2} END {if (V > 0) {print "TOTALS : VMs="V"	Ram="R/1024" GB"}}' < $TFILE
+rm -f $TFILE $JSON
+
+[ "$3" ] && disabler $CUST
+
+}
+
+cust_vms2 ()
+#:- cust_vms2 :uuid or :email |List customers VM's in all DC's (Show server and PI)
+{
+aud $@
+
+   UUID=""
+   if [ "$1" ]; then
+      UUID=$(get_uuid $1)
+      [ ! "$UUID" ] && echo "No UUID" && return
+   fi
+
+UUID=${UUID:-$_TB_OWNER}
+export CUST=$UUID
+
+[ ! "$UUID" ] && echo "Usage: cust_vms2 [sep] UUID" && return
+
+SEP=${2:-" "}
+JSON=/var/tmp/.$$.cust_vms.json
+OUT=/var/tmp/.$$.cust_vms.out
+
+QUERY="(%26(owner_uuid=$UUID)(|(state=running)(state=stopped)))"
+
+( echo DC ALIAS RAM UUID BRAND STATE HOST PLATFORM IP
+for dc in $AZS
+do
+      call_api $dc VMAPI "/vms?query=$QUERY" > $JSON
+      cat $JSON | \
+		 json -e 'this.billing_id = this.billing_id + ""' | \
+                 sed -e '/billing_id/ s/ /_/g' -e '/billing_id/ s/:_/: /' -e '/billing_id/ s/____/    /' | sed -e 's/__"pack/  "pack/' | \
+		 json -aH alias billing_id ram create_timestamp uuid brand state server_uuid | \
+                 while read ALIAS PACKAGE RAM CREATE UUID BRAND STATE SERVER
+                 do
+		    if [ "$SERVER" = "" ]; then
+			SERVER=$NIC
+			NIC=$STATE
+			STATE=$BRAND
+                        BRAND=$UUID
+			UUID=$CREATE
+			CREATE=$RAM
+			RAM=$PACKAGE
+			PACKAGE="."
+		    fi
+                    HOST="`call_api $dc CNAPI /servers/$SERVER | json -aH hostname current_platform`"
+                    PRIMARY=$(cat $JSON | json -aH uuid nics.0.ip nics.0.primary nics.1.ip nics.1.primary | grep $UUID | /usr/bin/cut -d'true' -f 1 | awk '{print $NF}')
+                    echo $dc $ALIAS $RAM $UUID $BRAND $STATE "$HOST" $PRIMARY
+                done | sort -k 7
+
+done ) > $OUT
+
+cat $OUT | column -t -s "$SEP"
+echo
+cat $OUT | grep -v "^DC " | awk '{T[$1]+=1;R[$1]+=$3} END { print "DC","VMs","RAM";for (i in T) {print i,T[i],R[i]}}' | column -t -s "$SEP"
+
+rm -f $JSON $OUT
+
+}
+
+cust_summary ()
+#:- cust_summary :uuid or :email |Summary of a customers details and deployment
+{
+aud $@
+
+   UUID=""
+   if [ "$1" ]; then
+      UUID=$(get_uuid $1)
+      [ ! "$UUID" ] && echo "No UUID" && return
+   fi
+
+UUID=${UUID:-$_TB_OWNER}
+export CUST=$UUID
+
+[ ! "$UUID" ] && echo "Usage: cust_summary UUID " && return
+
+echo "---------------------------------------------"
+cust $UUID
+echo "---------------------------------------------"
+
+QUERY="(%26(owner_uuid=$UUID)(|(state=running)(state=stopped)))"
+
+echo "DC       VMs RAM(gb)"
+echo "------- ---- -------"
+for dc in $AZS
+do
+  echo "DC $dc"
+  call_api $dc VMAPI "/vms?query=$QUERY" | json -aH ram
+done | \
+      nawk 'BEGIN {RT=0;VT=0}
+	   {if ( $1 == "DC" ) {TDC=$2}
+           else {V[TDC]+=1;R[TDC]+=$1;VT+=1;RT+=$1}}
+           END {for (dc in V)
+                    {printf("%-7s%5s%8s\n",dc,V[dc],int(R[dc]/1024))}
+                     printf("%-7s%5s%8s\n","=======","====","=======")
+                     printf("%-7s%5s%8s\n","TOTAL",VT,int(RT/1024))
+                     printf("%-7s%5s%8s\n","=======","====","=======")
+               }'
+
+echo "---------------------------------------------"
+}
+
+find_ip ()
+#:- find_ip :ip_address |Finds the VM with the given IP Address
+{
+aud $@
+
+IP=$1
+
+[ ! "$IP" ] && echo "Usage: find_ip IP_ADDRESS" && return
+
+O1=$(echo $IP | /usr/bin/cut -d '.' -f 1)
+O2=$(echo $IP | /usr/bin/cut -d '.' -f 2)
+O3=$(echo $IP | /usr/bin/cut -d '.' -f 3)
+
+case $O1 in
+   37)   SAZS=ams_1 ;;
+   8)    SAZS=west_1 ;;
+   64|199)  SAZS=sw_1 ;;
+   165)   SAZS=$AZS
+          [ "$O3" -ge 128 -a "$O3" -le 141 ] && SAZS=east_1
+          [ "$O3" -eq 176 ] && SAZS=east_1
+          [ "$O3" -ge 144 -a "$O3" -le 148 ] && SAZS=west_1
+          [ "$O3" -ge 152 -a "$O3" -le 156 ] && SAZS=sw_1 ;;
+   *)    SAZS=$AZS
+esac
+
+for dc in $SAZS
+do
+   read RESERVED FREE TYPE BELONG NET <<< \
+$({ echo '{}' | json -e "this.belongs_to_type = 'null', this.belongs_to_uuid = 'null'";call_api $dc NAPI "/search/ips?ip=$IP&fabric=false" | json -H | egrep -v "\[|\]"; } | json --merge -aH reserved free belongs_to_type belongs_to_uuid network_uuid)
+
+   if [ "$FREE" == "false" -a "$BELONG" != "null" -a "$TYPE" = "zone" ]; then
+      VM=true
+   else
+      VM=false
+   fi
+   [ "$NET" ] && break
+done
+
+if [ "$VM" = "true" ]; then
+   cat << ! | column -t
+$dc $(call_api $dc VMAPI "/vms/$BELONG" | json -aH alias uuid state owner_uuid nics.0.ip nics.1.ip)
+!
+
+elif [ "$VM" = "false" -a "$NET" ]; then
+   NET_NAME=`call_api $dc NAPI /networks/$NET | json -aH name`
+   echo "$IP found in $dc ($NET_NAME) but not assigned to a VM"
+   [ "$RESERVED" = "true" ] && echo "The IP is Reserved"
+else
+   echo "$IP Not found"
+fi
+}
+
+cn_state ()
+#:- cn_state :dc :hostname/:uuid |Summary of CN and VM's state
+{
+aud $@
+
+DC=$(valid_dc $1) || ( echo "Invalid DC name - Valid names are $AZS" && false ) || return
+
+CN_UUID=""
+
+if echo $2 | grep -q '[0-9a-f]\{8\}-[0-9a-f]\{4\}-[0-9a-f]\{4\}-[0-9a-f]\{4\}-[0-9a-f]\{12\}' ; then
+	CN_UUID=$2
+else
+	CN_UUID=$(call_api $DC CNAPI /servers?hostname=$2 | json -aH uuid )
+fi
+	
+cnapi $DC /servers/$CN_UUID | json -aH hostname status current_platform last_boot | awk '{print $1,"| Status:",$2,"| Platform:",$3,"| Last Boot:",$4}'
+echo "----------------------------------------------------"
+( echo ALIAS UUID OWNER_UUID BRAND STATE;
+vmapi $DC "/vms?query=(%26(server_uuid=$CN_UUID)(|(state=running)(state=stopped)(state=failed)))" | json -aH alias uuid owner_uuid brand state ) | column -t
+echo "----------------------------------------------------"
+vmapi $DC "/vms?query=(%26(server_uuid=$CN_UUID)(|(state=running)(state=stopped)(state=failed)))" | json -aH state | count
+echo "----------------------------------------------------"
+
+
+}
+
+cn_vms2 ()
+#:- cn_vms2 :dc :hostname |calls cnapi to list all the VM's for a CN
+{
+aud $@
+
+DC=$(valid_dc $1) || ( echo "Invalid DC name - Valid names are $AZS" && false ) || return
+CN_UUID=$(call_api $DC CNAPI /servers?hostname=$2 | json -aH uuid )
+
+[ ! "$CN_UUID" ] && echo "Bad hostname" && return
+[ "$CN_UUID" ] && cn_vms $DC $CN_UUID
+
+}
+
+cn_vms ()
+#:- cn_vms :dc :uuid |calls cnapi to list all the VM's for a CN
+{
+aud $@
+
+DC=$(valid_dc $1) || ( echo "Invalid DC name - Valid names are $AZS" && false ) || return
+CN=${2:-}
+
+[ ! "$CN" -a "$DC" ] && echo "Usage: cn_vms west_1|sw_1|east_1|ams_1 UUID" && return
+
+{ echo "VM_UUID ALIAS OWNER_UUID LOGIN EMAIL"
+vmapi $DC /vms?query="(%26(server_uuid=$CN)(|(state=running)(state=stopped)))" | json -aH uuid owner_uuid alias | \
+while read UUID OWN ALIAS
+do
+   CUST="`call_api $DC CAPI /customers/$OWN | json -aH login email`"
+
+   echo $UUID $ALIAS $OWN $CUST
+done
+} | column -t
+}
+
+pkg_list ()
+#:- pkg_list |Lists active packages in this DC
+{
+aud $@
+  FIL=${1:-g3}
+  ldapsearch $LDAP_S_OPTS "(&(objectclass=sdcpackage)(active=true))" | \
+    awk -v FIL=$FIL 'BEGIN {printf("%-32s%-37s%6s%5s %s\n","Name","UUID","CAP","vCPU","Description")
+                VCPU=null}
+         $1 == "name:" {NAME=substr($0,7)}
+         $1 == "uuid:" {UUID=$2}
+         $1 == "cpu_cap:" {CAP=$2}
+         $1 == "vcpus:" {VCPU=$2}
+         $1 == "description:" {DESC=substr($0,14)}
+         $1 == "zfs_io_priority:" {if ( NAME ~ FIL) {printf("%-32s%-37s%6s%5s %s\n",NAME,UUID,CAP,VCPU,DESC)}; VCPU=null}'
+}
+
+pkg_list_full ()
+#:- pkg_list_full |Lists ALL packages in this DC
+{
+aud $@
+  ldapsearch $LDAP_S_OPTS "objectclass=sdcpackage" | \
+    awk -v FIL=$FIL 'BEGIN {printf("%-32s%-37s%6s%5s %s\n","Name","UUID","CAP","vCPU","Description")
+                VCPU=null}
+         $1 == "name:" {NAME=gsub(/ /,"-",substr($0,7))}
+         $1 == "uuid:" {UUID=$2}
+         $1 == "cpu_cap:" {CAP=$2}
+         $1 == "vcpus:" {VCPU=$2}
+         $1 == "description:" {DESC=substr($0,14)}
+         $1 == "zfs_io_priority:" {printf("%-32s%-37s%6s%5s %s\n",NAME,UUID,CAP,VCPU,DESC); VCPU=null}'
+}
+
+vmi ()
+#:- vmi :ip_address |Calls find_ip to get UUID and then calls vm to display a VM summary
+{
+aud $@
+[ ! $1 ] && echo "Usage: vmi ip_address" && return 1
+
+VM_DC=""
+VM_UUID=""
+
+find_ip $1 > /var/tmp/$$.vmi
+while read F S T R
+do
+   if [ $F = $1 ]; then
+      cat /var/tmp/$$.vmi
+      rm /var/tmp/$$.vmi
+      return
+   else
+      VM_DC=$F
+      VM_UUID=$T
+      break
+   fi
+done < /var/tmp/$$.vmi
+
+rm /var/tmp/$$.vmi
+
+vm $VM_DC $VM_UUID $2
+}
+
+vm ()
+#:- vm :dc :uuid [S][Q]|Displays summary information for a VM. S = call svr(), Q = Quick, no job or FW stuff
+{
+aud $@
+# Get summary of VM information
+
+_TB_DC=$(valid_dc $1) || ( echo "Invalid DC name - Valid names are $AZS" && false ) || return
+_TB_UUID=$(get_uuid $2)
+TB_OPTS=$3
+CALL_SVR=false
+QUICK=false
+
+echo $TB_OPTS | egrep -q '[Qq]' && QUICK=true
+echo $TB_OPTS | egrep -q '[Ss]' && CALL_SVR=true
+
+if [ "$_TB_DC$_TB_UUID" = "" ]; then
+   echo 'Usage: dc uuid'
+   return 1
+fi
+
+call_api $_TB_DC VMAPI /vms/$_TB_UUID | json -H > /var/tmp/vm.$$
+
+read _TB_UUID _TB_BRAND _TB_SERVER _TB_OWNER _TB_ALIAS _TB_FW _TB_RAM _TB_SWAP _TB_CAP _TB_STATE _TB_CREATE _TB_PACKAGE _TB_IMAGE1 _TB_IMAGE2 _TB_VCPUS <<< \
+      `{ echo '{}' | json -e "this.vcpus = 'n/a', this.billing_id = 'blank'"; cat /var/tmp/vm.$$ ; } | \
+      json --merge -d , -aH uuid brand server_uuid owner_uuid alias firewall_enabled ram max_swap cpu_cap state create_timestamp billing_id "disks[0].image_uuid" alias image_uuid vcpus | \
+      sed 's/ /_/g' | sed 's/,/ /g'`
+
+if [ "$_TB_UUID" = "blank" ]; then
+   echo "Not Found"
+   return
+fi
+
+_TB_DOCKER_CMD="$(vmapi $_TB_DC /vms/$_TB_UUID | json -aH internal_metadata.docker:cmd)"
+_TB_DOCKER_CMD="${_TB_DOCKER_CMD:-n/a}"
+
+_TB_DOCKER_EP="$(vmapi $_TB_DC /vms/$_TB_UUID | json -aH internal_metadata.docker:entrypoint)"
+_TB_DOCKER_EP="${_TB_DOCKER_EP:-n/a}"
+
+read _TB_IP1 _TB_P1 <<< `{ echo '{}' | json -e "this.primary = 'false'"; cat /var/tmp/vm.$$ | json -aH "nics[0]" | json -a; } | \
+      json --merge -aH ip primary`
+
+read _TB_IP2 _TB_P2 <<< `{ echo '{}' | json -e "this.ip = 'n/a', this.primary = 'false'"; cat /var/tmp/vm.$$ | json -aH "nics[1]" ; } | \
+      json --merge -aH ip primary`
+
+if [ "$_TB_IMAGE1" = "$_TB_ALIAS" ]; then
+   _TB_IMAGE=${_TB_IMAGE2}
+else
+   _TB_IMAGE=${_TB_IMAGE1}
+fi
+
+read _TB_TAGS <<< $(cat /var/tmp/vm.$$ | json -aH tags | egrep -v "\{|\}" |\
+        sed "s/ //g" | sed 's/"//g' | sed "s/:/=/")
+
+_TB_SVR_HOST=""
+_TB_SVR_PLATFORM=""
+[ "$QUICK" = "false" ] && read _TB_SVR_HOST _TB_SVR_PLATFORM <<< `call_api $_TB_DC CNAPI /servers/$_TB_SERVER | json -aH hostname current_platform`
+
+_TB_SVR_IP=""
+if [ "$QUICK" = "false" ] ; then
+# Check for Aggregations
+    _TB_SVR_AGGRS="$(cnapi $_TB_DC /servers/$_TB_SERVER | json -H sysinfo."Link Aggregations" | json -a --keys )"
+    for AGG in $_TB_SVR_AGGRS
+    do
+       _TB_SVR_IP=$(cnapi $_TB_DC /servers/$_TB_SERVER | json -aH sysinfo."Network Interfaces".$AGG.ip4addr)
+       [ "$_TB_SVR_IP" ] && break
+    done
+
+# If no IP from Aggrs get it from the Admin NIC
+
+    [ ! "$_TB_SVR_IP" ] && _TB_SVR_IP=`call_api $_TB_DC NAPI "/nics?belongs_to_uuid=$_TB_SERVER" | json -aH ip nic_tags_provided[0] | grep admin | awk '{print $1}'`
+fi
+
+_TB_VNC_HOST=""
+_TB_VNC_PORT=""
+
+[ "$QUICK" = "false" ] && if [ $_TB_BRAND = "kvm" ]; then
+   read _TB_VNC_HOST _TB_VNC_PORT <<< `call_api $_TB_DC CNAPI /servers/$_TB_SERVER/vms/$_TB_UUID/vnc | json -aH host port`
+fi
+
+_TB_LOGIN=""
+_TB_LOGIN="`call_api $_TB_DC CAPI /customers/$_TB_OWNER | json -aH login email`"
+
+_TB_IMAGE_OWNER=""
+_TB_IMAGE_NAME=""
+_TB_IMAGE_VERSION=""
+_TB_PACKAGE_NAME=""
+[ "$QUICK" = "false" ] && read _TB_IMAGE_OWNER _TB_IMAGE_NAME _TB_IMAGE_VERSION <<< `call_api $_TB_DC IMGAPI /images/$_TB_IMAGE | json -aH owner name version`
+[ "$QUICK" = "false" ] && read _TB_PACKAGE_NAME <<< `call_api $_TB_DC PAPI /packages/$_TB_PACKAGE | json -aH name `
+
+[ "$_TB_IMAGE_OWNER" = $_TB_OWNER ] && _TB_PRIV_IMG="(PRIVATE)" || _TB_PRIV_IMG="(public)"
+
+for VAR in `set | grep ^_TB_ | /usr/bin/cut -d= -f 1`
+do
+   export $VAR
+done
+
+rm /var/tmp/vm.$$
+
+cvm $TB_OPTS
+
+}
+
+cvm()
+#:- cvm |Redisplays the VM summary from the last call to vm/vmi. Job list is refreshed
+{
+aud $@
+
+TB_OPTS=$1
+CALL_SVR=false
+QUICK=false
+
+echo $TB_OPTS | egrep -q '[Qq]' && QUICK=true
+echo $TB_OPTS | egrep -q '[Ss]' && CALL_SVR=true
+
+IMO="$(imo $_TB_DC $_TB_UUID | sed 's/^/          /' | tail +2)"
+[ "$IMO" ] && IMO="$IMO
+"
+
+cat << !
+---------------------------------------
+DC:       $_TB_DC
+UUID:     $_TB_UUID
+BRAND:    $_TB_BRAND
+SERVER:   $_TB_SERVER ($_TB_SVR_HOST / $_TB_SVR_IP / $_TB_SVR_PLATFORM)
+OWNER:    $_TB_OWNER ($_TB_LOGIN)
+ALIAS:    $_TB_ALIAS
+CMD:      $_TB_DOCKER_CMD
+ENTRY:    $_TB_DOCKER_EP
+FIREWALL: $_TB_FW
+STATE:    $_TB_STATE
+CREATED:  $_TB_CREATE
+RAM:      $_TB_RAM (SWAP: $_TB_SWAP)
+IMAGE:    $_TB_IMAGE ($_TB_IMAGE_NAME $_TB_IMAGE_VERSION $_TB_PRIV_IMG)
+${IMO}PACKAGE:  $_TB_PACKAGE ($_TB_PACKAGE_NAME)
+CPU_CAP:  $_TB_CAP
+VCPUs:    $_TB_VCPUS
+TAGS:     $_TB_TAGS
+IP1:      $_TB_IP1 `[ $_TB_P1 = "true" ] && echo "(Primary)"`
+IP2:      $_TB_IP2 `[ $_TB_P2 = "true" ] && echo "(Primary)"`
+VNC:      $_TB_VNC_HOST / $_TB_VNC_PORT
+---------------------------------------
+!
+if [ "$QUICK" = "false" ] ; then
+   echo JOBS
+   ( echo "Name UUID Result Time Origin info"
+   call_api $_TB_DC VMAPI /vms/$_TB_UUID/jobs | json -aH params.task uuid execution created_at params.origin params.context.params.account ) | column -t
+
+   echo "---------------------------------------"
+fi
+
+[ "$QUICK" = "false" ] && vm_fw $_TB_DC $_TB_UUID
+
+[ "$CALL_SVR" = "true" ] && svr
+}
+
+svr()
+#:- svr |SSH to the CN of the last VM displayed by vm/vmi
+{
+aud $_TB_SVR_HOST $_TB_SVR_IP
+   echo "SSH to $_TB_SVR_HOST / $_TB_SVR_IP"
+   echo "Current VM UUID = $_TB_UUID"
+   ssh -l $CURR_USER $_TB_SVR_IP
+}
+
+img()
+#:- img |Display details of the Image of the last VM displayed by vm/vmi
+{
+aud $@
+   call_api $_TB_DC IMGAPI /images/$_TB_IMAGE | json -H
+}
+
+vmping()
+#:- vmping |Ping the first IP of the last VM displayed by vm/vmi
+{
+   ping $_TB_IP1
+}
+
+cust()
+#:- cust :uuid or :email|Display the customer record of the last VM displayed by vm/vmi
+{
+aud $@
+   UUID=""
+   if [ "$1" ]; then
+      UUID=$(get_uuid $1)
+      [ ! "$UUID" ] && echo "No UUID" && return
+   fi
+
+   DATA=$(ldapsearch $LDAP_S_OPTS uuid=${UUID:-$_TB_OWNER} | ldap_to_json | json -d^ -aH cn email givenname login phone sn uuid approved_for_provisioning created_at updated_at company country account)
+   TYPE=ACCOUNT
+   ACC_L=""
+   ACC=$(echo $DATA | /usr/bin/cut -d^ -f13)
+
+   if [ "$ACC" ]; then
+      DATA2=$(ldapsearch $LDAP_S_OPTS uuid=$ACC | ldap_to_json | json -d^ -aH cn email givenname login phone sn uuid approved_for_provisioning created_at updated_at company country account)
+      ACC_L=$(echo $DATA2 | /usr/bin/cut -d^ -f4)
+      ACC_E=$(echo $DATA2 | /usr/bin/cut -d^ -f2)
+      TYPE="SUB_USER of Account $ACC_L ($ACC_E)"
+      ACC_L=$ACC_L"/"
+   fi
+
+cat << !
+Type:      $TYPE
+Login:     $ACC_L$(echo $DATA | /usr/bin/cut -d^ -f4)
+UUID:      $(echo $DATA | /usr/bin/cut -d^ -f7)
+Email:     $(echo $DATA | /usr/bin/cut -d^ -f2)
+Name:      $(echo $DATA | /usr/bin/cut -d^ -f1) $(echo $DATA | /usr/bin/cut -d^ -f6)
+Phone:     $(echo $DATA | /usr/bin/cut -d^ -f5)
+Company:   $(echo $DATA | /usr/bin/cut -d^ -f11)
+Country:   $(echo $DATA | /usr/bin/cut -d^ -f12)
+Created:   $(date --date=@$(echo $DATA | /usr/bin/cut -d^ -f9 | cut -c1-10))
+Updated:   $(date --date=@$(echo $DATA | /usr/bin/cut -d^ -f10 | cut -c1-10))
+Approved:  $(echo $DATA | /usr/bin/cut -d^ -f8)
+
+AdminUI:   https://$ADMINUI_URL/users/$UUID
+Supmon:    https://supmon.joyent.com/m/search-owner.html?owner=$UUID
+!
+
+}
+
+docs()
+#:- docs |Display the tools box documentation
+{
+   ver
+   grep '^#:-' $TOOLBOX | sort | sed 's/#:- //' | awk -F"|" '{printf("%-35s- %s\n",$1,$2)}'
+}
+
+disabler ()
+#:- disabler :uuid/:email [NP]|Disables a user. NP = appends '.nonpayment' instead of the default ('.disabled')
+{
+aud $@
+
+   UUID=""
+   if [ "$1" ]; then
+      UUID=$(get_uuid $1)
+      [ ! "$UUID" ] && echo "No UUID" && return
+   fi
+
+UUID=${UUID:-$_TB_OWNER}
+[ ! "$UUID" ] && echo "Usage: disabler UUID" && return
+
+#IFS=:
+ldapsearch $LDAP_S_OPTS "(&(objectclass=sdcperson)(uuid=$UUID))" | \
+while read KEY REST
+do
+   REST=`echo $REST | sed 's/ //'`
+   KEY=$(echo $KEY | cut -d: -f1)
+   [ "$KEY" ] && echo $KEY=\"$REST\"
+done > /tmp/vars.$$
+
+. /tmp/vars.$$
+rm /tmp/vars.$$
+
+[ ! "$uuid" ] && echo "Customer $UUID not found" && return
+
+if [ "$2" = "NP" ]; then
+   DIS="$CURR_USER.nopay"
+else
+   DIS="$CURR_USER.fraud"
+fi
+DIS=${DIS}.$(date +%S%M%H)
+
+DIS_STRING=$(echo ${login}.$DIS | awk '{print substr($0,1,32)}')
+
+echo "Confirm disabling - login=$login with ${DIS_STRING} (y/n)"
+while read ANS
+do
+   case $ANS in
+      y) break ;;
+      n) echo "aborted"; return ;;
+      *) ;;
+   esac
+done
+
+cat << ! > /tmp/$$.ldif
+dn: $dn
+changetype: modify
+replace: login
+login: $DIS_STRING
+
+dn: $dn
+changetype: modify
+replace: email
+email: $email.$DIS
+
+dn: $dn
+changetype: modify
+replace: approved_for_provisioning
+approved_for_provisioning: false
+!
+
+ldapmodify $LDAP_OPTS -f /tmp/$$.ldif
+
+ldapsearch $LDAP_S_OPTS "(&(objectclass=sdcperson)(uuid=$UUID))"
+unset IFS
+cat /tmp/$$.ldif
+rm -rf /tmp/$$.ldif
+}
+
+vms_by_pkg()
+#:- vms_by_pkg :package [state] |Find VMS by package name. Default state=running
+{
+   STATE=${2:-running}
+   {
+   echo DC ALIAS UUID RAM BILLING_ID OWNER CREATED
+   for DC in $AZS
+   do
+      PU=$(papi $DC /packages?name=$1 | json -aH uuid)
+      [ ! "$PU" ] && continue
+      QUERY="query=(%26(state=$STATE)(|"
+      for PUUID in $PU
+      do
+	QUERY=$QUERY"(billing_id=$PUUID)"
+      done
+      QUERY=$QUERY"))"
+      call_api $DC VMAPI "/vms?$QUERY" | json -aH alias uuid ram billing_id owner_uuid create_timestamp | prefix $DC
+   done
+   } | column -t
+}
+
+risk ()
+#:- risk :cust_uuid or :email|print the account sign up risk analysis
+{
+aud $@
+   UUID=""
+   if [ "$1" ]; then
+      UUID=$(get_uuid $1)
+      [ ! "$UUID" ] && echo "No UUID" && return
+   fi
+
+echo "Account Risk Info"
+echo "-----------------"
+cust ${UUID:-$_TB_OWNER}
+echo
+echo "Phone Verification:   `capi $UFDS_MASTER /customers/${UUID:-$_TB_OWNER}/metadata/portal/phoneverification | json -aH value`"
+echo "Sign Setup:           `capi $UFDS_MASTER /customers/${UUID:-$_TB_OWNER}/metadata/portal/signsetup | json -aH value`"
+echo "Account History:      `(echo '{ "value": null }' ; capi $UFDS_MASTER /customers/${UUID:-$_TB_OWNER}/metadata/portal/accounthistory | json -H ; )  | json --merge -aH value | json `"
+echo "Risk Score:           `capi $UFDS_MASTER /customers/${UUID:-$_TB_OWNER}/metadata/portal/riskscore | json -aH value`"
+echo "Risk Explaination:    `capi $UFDS_MASTER /customers/${UUID:-$_TB_OWNER}/metadata/portal/riskscoreexplanation | json -aH value`"
+echo "Blocking Reason:      `capi $UFDS_MASTER /customers/${UUID:-$_TB_OWNER}/metadata/portal/blockingreason | json -aH value`"
+}
+
+cust_imgs ()
+#:- cust_imgs :cust_uuid or :email|List private images for a customer
+{
+aud $@
+
+   UUID=""
+   if [ "$1" ]; then
+      UUID=$(get_uuid $1)
+      [ ! "$UUID" ] && echo "No UUID" && return
+   fi
+
+for dc in $AZS
+do
+   echo "--> $dc"
+   call_api $dc IMGAPI /images?owner=${UUID:-$_TB_OWNER} | json -aH name uuid published_at origin | awk '{printf("%-40s%-37s%-20s%-37s\n",$1,$2,substr($3,1,19),$4)}'
+done
+}
+
+vm_keys ()
+#:- vm_key :List the keys and fingerprints in the metadata of a VM
+{
+aud $@
+
+_TB_DC=$(valid_dc $1) || ( echo "Invalid DC name - Valid names are $AZS" && false ) || return
+_TB_UUID=$2
+
+vmapi $_TB_DC /vms/$_TB_UUID | json -aH customer_metadata.root_authorized_keys > /var/tmp/$$.keys
+
+split -l 1 /var/tmp/$$.keys /var/tmp/$$.keys.
+
+echo "SSH Keys for $_TB_DC /vms/$_TB_UUID"
+echo
+
+for f in /var/tmp/$$.keys.*
+do
+   ssh-keygen -l -f $f
+done | grep ":" | awk '{print $1,$2}'
+
+}
+
+
+vm_fw ()
+#:- vm_fw :dc :vm_uuid |List Firewall rules applicable to a VM
+{
+aud $@
+echo ENABLED RULES
+call_api ${1:-$_TB_DC} FWAPI /firewalls/vms/${2:-$_TB_UUID} | json -aH enabled rule | awk '{printf("%-8s%s\n",$1,substr($0,index($0," ")+1))}'
+echo "---------------------------------------"
+}
+
+valid_dc ()
+#:- valid_dc :dc |Validates a dc name and switches - to _
+{
+
+DC=$(echo $1 | sed 's/-/_/')
+
+echo $AZS | grep $DC >/dev/null 2>&1
+
+RES=$?
+
+echo $DC
+
+return $RES
+}
+
+api ()
+{
+   API=$1
+   AZ=$2
+   shift 2
+   call_api $AZ $API $@
+}
+
+count()
+#:- count |Counts distinct values of the first field on the input stream
+{
+   awk 'BEGIN {L=0}
+        {T[$1]+=1
+         if (length($1) > L) {L=length($1)}
+        }
+        END {L=L+1
+             F="%-"L"s%d\n"
+             for (i in T) {printf(F,i,T[i]) }
+            }' | sort
+}
+
+sum()
+#:- sum |Sums the values of the second field on the input stream
+{
+   awk 'BEGIN {L=0}
+        {T[$1]+=$2
+         if (length($1) > L) {L=length($1)}
+        }
+        END {L=L+1
+             F="%-"L"s%d\n"
+             for (i in T) {printf(F,i,T[i]) }
+            }' | sort
+}
+
+limits ()
+#:- limits :uuid or :email|Display the provisioning limits for a user
+{
+aud $@
+
+   UUID=""
+   if [ "$1" ]; then
+      UUID=$(get_uuid $1)
+      [ ! "$UUID" ] && echo "No UUID" && return
+   fi
+
+   echo "Existing limits for `cust ${UUID:-$_TB_OWNER} | grep Login`"
+   echo
+   ldapsearch $LDAP_S_OPTS -b "UUID=${UUID:-$_TB_OWNER}, ou=users, o=smartdc" objectclass=capilimit |\
+      awk '$1 == "datacenter:" {DC=$2}
+           $1 == "limit:" {printf("%-12s%s\n",DC,$2)}'
+}
+
+alias vmapi="api VMAPI"
+#:- vmapi :dc :path :options |Call to vmapi
+alias cnapi="api CNAPI"
+#:- cnapi :dc :path :options |Call to cnapi
+alias imgapi="api IMGAPI"
+#:- imgapi :dc :path :options |Call to imgapi
+alias capi="api CAPI"
+#:- capi :dc :path :options |Call to capi
+alias fwapi="api FWAPI"
+#:- fwapi :dc :path :options |Call to fwapi
+alias workflow="api WORKFLOW"
+#:- workflow :dc :path :options |Call to workflow
+
+cn_res()
+#:- cn_res :dc :cn_uuid |Free Ram. Disk and CPU per CN
+{
+aud $@
+
+if [ "$2" ]; then
+   CN="/$2"
+else
+   CN="?extras=all"
+fi
+
+( echo "HOSTNAME UUID RAM(GB) DISK(GB) FREE_CPU"
+cnapi $1 /servers$CN | json -aH hostname uuid disk_pool_size_bytes disk_pool_alloc_bytes unreserved_ram unreserved_cpu |
+while read HOSTNAME UUID POOLS POOLA URAM UCPU
+do
+   typeset -i FREE=$POOLS-$POOLA
+   typeset -i FREE_GB=$FREE/1024/1024/1024
+   typeset -i FREE_RAM=$URAM/1024
+
+   echo $HOSTNAME $UUID $FREE_RAM $FREE_GB $UCPU
+done ) | column -t
+
+
+
+}
+
+disku()
+#:- disku :dc :cn_uuid
+{
+aud $@
+
+read HOSTNAME POOLS POOLA KVM_VOLSIZE KVM_VOLUSED KVM_QUOTA ZONE_QUOTA KVW_USED ZONE_USED IMGS_USED<<< \
+     $(cnapi $1 /servers/$2 | json -aH hostname disk_pool_size_bytes disk_pool_alloc_bytes disk_kvm_zvol_volsize_bytes disk_kvm_zvol_used_bytes disk_kvm_quota_bytes disk_zone_quota_bytes disk_kvm_quota_used_bytes disk_zone_quota_used_bytes disk_installed_images_used_bytes)
+
+typeset -i FREE=$POOLS-$POOLA
+typeset -i FREE_GB=$FREE/1024/1024/1024
+
+echo "Disk usage for $1 $HOSTNAME ($2)"
+
+echo FREE_GB=$FREE_GB
+
+typeset -i KVM_MAX_VOL_SIZE_GB=$KVM_VOLSIZE/1024/1024/1024
+typeset -i ZONE_MAX_SIZE_GB=($KVM_QUOTA+$ZONE_QUOTA)/1024/1024/1024
+typeset -i KVM_USED_GB=$KVM_VOLUSED/1024/1024/1024
+typeset -i ZONE_USED_GB=($KVM_USED+$ZONE_USED)/1024/1024/1024
+typeset -i IMGS_USED_GB=$IMGS_USED/1024/1024/1024
+
+cat << !
+Max KVM = $KVM_MAX_VOL_SIZE_GB
+Max Zone = $ZONE_MAX_SIZE_GB
+Used KVM = $KVM_USED_GB
+Used Zone = $ZONE_USED_GB
+Images Used = $IMGS_USED_GB
+!
+
+typeset -i MAX=$KVM_MAX_VOL_SIZE_GB+$ZONE_MAX_SIZE_GB
+typeset -i USED=$KVM_USED_GB+$ZONE_USED_GB
+
+typeset -i UNUSED_ALLOC=$MAX-$USED
+
+typeset -i DEBT=$FREE_GB-$UNUSED_ALLOC
+
+cat << !
+
+Max possible usage = $MAX
+Actual Used Now = $USED
+
+Possible additional usage = $UNUSED_ALLOC
+
+Logical Free = $DEBT
+!
+
+[ $FREE_GB -lt $UNUSED_ALLOC ] && echo OVER-PROVISIONED
+[ $FREE_GB -lt $UNUSED_ALLOC ] && echo DEBT = $DEBT
+
+}
+
+get_uuid()
+#:- uuid :email_or_uuid| Converts an email to a uuid or just returns the uuid (or bails)
+{
+
+IN=$1
+
+# Check for Docker UUID
+echo $IN | grep -q '[0-9a-f]\{64\}' && IN=$(echo $IN |\
+	 awk '{print substr($0,1,8)"-"substr($0,9,4)"-"substr($0,13,4)"-"substr($0,17,4)"-"substr($0,21,12)}')
+
+echo $IN | grep -q '[0-9a-f]\{8\}-[0-9a-f]\{4\}-[0-9a-f]\{4\}-[0-9a-f]\{4\}-[0-9a-f]\{12\}' && echo $IN && return
+
+if echo $IN | grep -q '[a-zA-Z0-9.-].*@[a-zA-Z0-9.-].*\.[a-zA-Z0-9.-].*' ; then
+   UUID=$(em_search $IN | /usr/bin/cut -d' ' -f 1)
+   if [ "$UUID" = "Not" ]; then
+      echo ""
+   elif [ "$UUID" ]; then
+      echo $UUID
+   else
+      return 1
+   fi
+else
+   return 1
+fi
+}
+
+pi()
+#:- pi [B]| Tabular list of PI's running [or Booting]
+{
+aud $@
+
+B=current_platform
+[ "$1" ] && B=boot_platform
+
+# Get the PI Lists
+for DC in $AZS
+do
+   DMP=$(call_api $DC SAPI /services?name=cnapi | json -aH metadata.ALLOC_FILTER_DOCKER_MIN_PLATFORM)
+   call_api $DC CNAPI /servers | json -aH $B | count > /var/tmp/pi.$$.$DC.1
+   sed 's/.* /TOTALS /' /var/tmp/pi.$$.$DC.1 | sum >> /var/tmp/pi.$$.$DC.1
+   ex /var/tmp/pi.$$.$DC.1 << !
+/$DMP/s/$/*/
+w
+q
+!
+done
+
+cat /var/tmp/pi.$$.*.1 | sum > /var/tmp/pi.$$.tots
+
+# Get the super set of PI's
+
+/usr/bin/cut -d ' ' -f 1 /var/tmp/pi.$$.*.1 | sort -u > /var/tmp/pis.$$
+
+# Add the -'s
+for DC in $AZS
+do
+   join -o 1.2 -e - -a 1 -a 2 -a 2 /var/tmp/pi.$$.$DC.1 /var/tmp/pis.$$ > /var/tmp/pi.$$.$DC.2
+done
+
+echo $P
+( echo PI $AZS TOTALS ; paste /var/tmp/pis.$$ /var/tmp/pi.$$.*.2 | join - /var/tmp/pi.$$.tots ) | column -t
+echo '(* denotes DOCKER_MIN_PLATFORM)'
+
+rm -f /var/tmp/pi.$$.* /var/tmp/pis.$$
+
+}
+
+last_boot()
+#:- last_boot| Tabular list of last boot times
+{
+aud $@
+
+# Get the last_boot Lists
+for DC in $AZS
+do
+   call_api $DC CNAPI /servers | json -aH last_boot | cut -c 1-10 | count > /var/tmp/lb.$$.$DC.1
+   sed 's/.* /TOTALS /' /var/tmp/lb.$$.$DC.1 | sum >> /var/tmp/lb.$$.$DC.1
+done
+
+cat /var/tmp/lb.$$.*.1 | sum > /var/tmp/lb.$$.tots
+
+# Get the super set of dates
+
+/usr/bin/cut -d ' ' -f 1 /var/tmp/lb.$$.*.1 | sort -u > /var/tmp/lbs.$$
+
+# Add the -'s
+for DC in $AZS
+do
+   join -o 1.2 -e - -a 1 -a 2 -a 2 /var/tmp/lb.$$.$DC.1 /var/tmp/lbs.$$ > /var/tmp/lb.$$.$DC.2
+done
+
+echo $P
+( echo DATE $AZS TOTALS ; paste /var/tmp/lbs.$$ /var/tmp/lb.$$.*.2 | join - /var/tmp/lb.$$.tots ) | column -t
+
+rm -f /var/tmp/lb.$$.* /var/tmp/lbs.$$
+
+}
+
+add_notify_roles ()
+#:- add_notify_roles :uuid or :email | Create the JPC-Notifications* roles for a user
+{
+aud $@
+
+   UUID=""
+   if [ "$1" ]; then
+      UUID=$(get_uuid $1)
+      [ ! "$UUID" ] && echo "No UUID" && return
+   fi
+
+   [ ! "$UUID" ] && echo "Usage: add_notify_roles :uuid or :email" && return
+
+   for ROLE in Incident Maintenance Emergency-Maintenance All
+   do
+
+      EXIST=$(ldapsearch $LDAP_S_OPTS "(&(objectclass=sdcaccountrole)(account=$UUID)(name=JPC-Notifications-$ROLE))" | ldap_to_json | json -aH uuid)
+
+      if [ ! "$EXIST" ]; then
+         echo Creating JPC-Notifcations-$ROLE
+         ROLE_UUID=$(/usr/bin/uuid)
+         ldapadd $LDAP_OPTS << !
+dn: role-uuid=$ROLE_UUID, uuid=$UUID, ou=users, o=smartdc
+account: $UUID
+name: JPC-Notifications-$ROLE
+objectclass: sdcaccountrole
+uuid: $ROLE_UUID
+!
+      else
+         echo JPC-Notifcations-$ROLE already exists
+     fi
+   done
+
+}
+
+notify_roles ()
+#:- notify_roles :uuid or :email | List the emails associated with the JPC-Notifications* roles for a user
+{
+aud $@
+
+   UUID=""
+   if [ "$1" ]; then
+      UUID=$(get_uuid $1)
+      [ ! "$UUID" ] && echo "No UUID" && return
+   fi
+
+   [ ! "$UUID" ] && echo "Usage: notify_roles :uuid or :email" && return
+
+# Get all the user uuids on each role
+
+   for ROLE in Incident Maintenance Emergency-Maintenance All
+   do
+
+      ldapsearch $LDAP_S_OPTS "(&(objectclass=sdcaccountrole)(account=$UUID)(name=JPC-Notifications-$ROLE))" | ldap_to_json | json -aH account | \
+      while read USER_UUID
+      do
+         echo $(ldapsearch $LDAP_S_OPTS "(&(uuid=$USER_UUID)(objectclass=sdcperson))" | ldap_to_json | json -aH email) $ROLE
+      done
+
+   done > /var/tmp/role-users.$$
+
+# Convert the uuids to emails
+
+   /usr/bin/cut -d ' ' -f 1 /var/tmp/role-users.$$ | sort -u | \
+   while read EMAIL
+   do
+      FLAGS=""
+
+      for ROLE in Incident Maintenance Emergency-Maintenance All
+      do
+         X=$(grep "$EMAIL $ROLE" /var/tmp/role-users.$$ | sed "s/$ROLE/X/" | /usr/bin/cut -d ' ' -f 2)
+         [ ! "$X" ] && X="-"
+         FLAGS=$FLAGS" "$X
+      done
+
+      echo $EMAIL $FLAGS
+   done > /var/tmp/role-emails.$$
+
+   ( echo EMAIL Incident Maintenance Emergency-Maintenance All ; cat /var/tmp/role-emails.$$ ) | column -t
+
+#   rm -f /var/tmp/roles-*.$$
+
+}
+
+add-key ()
+#:- add-key :uuid or :email |Add an SSH key to an account for debugging
+{
+aud $@
+
+   UUID=""
+   if [ "$1" ]; then
+      UUID=$(get_uuid $1)
+      [ ! "$UUID" ] && echo "No UUID" && return
+   fi
+
+echo "Paste your SSH key and hit Enter"
+
+read _TB_KEY
+echo $_TB_KEY > /var/tmp/$$.key.pub
+
+sdc-useradm add-key -n $(id -un)-Joyent $UUID /var/tmp/$$.key.pub
+
+rm -f /var/tmp/$$.key.pub
+}
+
+fvm ()
+#:- fvm :uuid |Find the VM across all DC's and call vm()
+{
+aud $@
+
+UUID=$1
+
+[ ! "$UUID" ] && echo "Usage: fvm UUID" && return
+
+for dc in $AZS
+do
+      [ "$(vmapi $dc "/vms/$UUID" | json -aH uuid)" ] && vm $dc $UUID
+done
+
+}
+
+fail_vm()
+#:- fail_vm :dc :uuid |Mark a VM that is stuck in provisioning as "failed"
+{
+aud $@
+
+DC=$(valid_dc $1) || ( echo "Invalid DC name - Valid names are $AZS" && false ) || return
+UUID=$2
+
+[ ! "$UUID" ] && echo "Usage: fail_vm DATA_CENTER UUID" && return
+
+echo "Confirm Fail VM - UUID==$UUID (y/n)"
+while read ANS
+do
+   case $ANS in
+      y) break ;;
+      n) echo "aborted"; return ;;
+      *) ;;
+   esac
+done
+
+vmapi $DC /job_results -X POST --data '{ "vm_uuid": "'$UUID'", "execution": "failed" }'
+
+}
+
+prefix()
+{
+while read ALL
+do
+   echo $1 $ALL
+done
+}
+
+to_zd ()
+#:- to_zd :zd_ticket [t] |Send stdin to a ZD ticket as a private comment in a code block. t = text not code
+{
+aud $@
+
+TID=$1
+
+rm -f /var/tmp/$$.to_zd
+
+[ ! "$TID" ] && echo "Usage: to_zd ticket_id" && return
+
+cat << ! > /var/tmp/$$.to_zd
+{
+   "ticket": {
+      "comment": {
+         "public": false,
+!
+
+COMMENT="Comment added by $CURR_USER\n\n"
+
+if [ ! "$2" = "t" ]; then
+   COMMENT="${COMMENT}~~~\n"
+fi
+
+while read ALL
+do
+   echo "$ALL"
+   if echo $ALL | egrep 'https?:\/\/' > /dev/null; then
+      if [ ! "$2" = "t" ]; then
+         COMMENT="${COMMENT}~~~\n${ALL}\n\n~~~\n"
+      fi
+   else
+      COMMENT="${COMMENT}${ALL}\n"
+   fi
+done
+
+if [ ! "$2" = "t" ]; then
+   COMMENT="${COMMENT}~~~\n"
+fi
+
+COMMENT=$(echo $COMMENT | sed 's/\\n~~~\\n~~~\\n//g')
+
+cat << ! >> /var/tmp/$$.to_zd
+         "body": "$COMMENT"
+      }}}
+!
+
+curl https://joyentcloud.zendesk.com/api/v2/tickets/${TID}.json \
+   -H "Content-Type: application/json" \
+   --data-binary @/var/tmp/$$.to_zd \
+   -u "$NOTIFY_USER:$NOTIFY_PASSWORD" -X PUT 2> /dev/null | (echo;echo -n "--> Comment add to ticket ZD-"; json -aH ticket.id ticket.subject)
+
+}
+
+zd ()
+#:- zd :zd_ticket |get email from ticket and push JPC Summary back to ticket
+{
+aud $@
+TID=$1
+
+[ ! "$TID" ] && echo "Usage: to_zd ticket_id" && return
+
+REQUESTER=$(curl https://joyentcloud.zendesk.com/api/v2/tickets/${TID}.json \
+   -u "$NOTIFY_USER:$NOTIFY_PASSWORD" \
+   -X GET 2> /dev/null | json -aH ticket.requester_id )
+
+REQ_EMAIL=$(curl https://joyentcloud.zendesk.com/api/v2/users/${REQUESTER}.json \
+   -u "$NOTIFY_USER:$NOTIFY_PASSWORD" \
+   -X GET 2> /dev/null | json -aH user.email)
+
+{
+echo "--> Ticket ZD-$TID - Email: $REQ_EMAIL"
+em_search $REQ_EMAIL || return
+UUID=$(em_search $REQ_EMAIL | /usr/bin/cut -d' ' -f1)
+echo
+cust $UUID
+echo
+cust_vms $UUID
+} | to_zd $TID d
+
+}
+
+tier ()
+#:- tier :zd_ticket |Show Support tier and other Org data from ZD
+{
+aud $@
+TID=$1
+
+[ ! "$TID" ] && echo "Usage: tier ticket_id" && return
+
+REQUESTER=$(curl https://joyentcloud.zendesk.com/api/v2/tickets/${TID}.json \
+   -u "$NOTIFY_USER:$NOTIFY_PASSWORD" \
+   -X GET 2> /dev/null | json -aH ticket.requester_id )
+
+ORG=$(curl https://joyentcloud.zendesk.com/api/v2/users/${REQUESTER}.json \
+   -u "$NOTIFY_USER:$NOTIFY_PASSWORD" \
+   -X GET 2> /dev/null | json -aH user.organization_id)
+
+read TIER SDC NODE NAME <<< $(curl https://joyentcloud.zendesk.com/api/v2/organizations/${ORG}.json \
+   -u "$NOTIFY_USER:$NOTIFY_PASSWORD" \
+   -X GET 2> /dev/null | json -aH organization | json organization_fields.support_tier organization_fields.sdc_status organization_fields.node_js_core_support name)
+
+echo "--> Ticket ZD-$TID - Org: $NAME"
+{
+echo SUPPORT-TIER SDC-STATUS NODE-SUPPORT
+echo $TIER $SDC $NODE
+} | column -t
+}
+
+auth_vm ()
+#:- auth_vm :zd_ticket :VM_UUID |Show if the ticket requester is authorised for the given machine UUID
+{
+aud $@
+TID=$1
+
+UUID=$2
+
+for dc in $AZS
+do
+      OWN="$(vmapi $dc "/vms/$UUID" | json -aH owner_uuid)"
+      if [ "$OWN" ]; then
+         auth $TID $OWN "--> Instance $UUID owned by $OWN in $dc"
+         return
+      fi
+done
+}
+
+auth_ip ()
+#:- auth_ip :zd_ticket [:IP] |Show if the ticket requester is authorised for the IP (Omit IP to use IP on ticket)
+{
+aud $@
+TID=$1
+
+IP=$2
+
+if [ ! "$IP" ]; then # Get IP from ticket
+   IP=$(curl https://joyentcloud.zendesk.com/api/v2/tickets/${TID}.json \
+      -u "$NOTIFY_USER:$NOTIFY_PASSWORD" \
+      -X GET 2> /dev/null | json -aH ticket.fields | json -a id value| grep 20915658 | /usr/bin/cut -d' ' -f 2)
+   if [ ! "$IP" ]; then
+      echo "No IP provided and IP not found on ticket"
+      return
+   fi
+fi
+
+FIND_IP=$(find_ip $IP )
+if echo $FIND_IP | grep -q found ; then
+   echo $FIND_IP
+   return
+fi
+
+OWN=$(echo $FIND_IP | awk '{print $5}')
+DC=$(echo $FIND_IP | awk '{print $1}')
+
+auth $TID $OWN "--> Instance with IP $IP Owned by $OWN in $DC"
+}
+
+auth ()
+#:- auth :zd_ticket :account_uuid |Show if the ticket requester is authorised for the given account
+{
+aud $@
+TID=$1
+
+UUID=$2
+if [ ! "$UUID" ]; then
+   echo Usage: auth :zd_ticket :account_uuid
+   return
+fi
+
+shift 2
+MSG="$@"
+
+[ ! "$TID" ] && echo "Usage: auth ticket_id UUID" && return
+
+{
+# Output any message provided by caller
+
+[ "$MSG" ] && echo "$MSG"
+
+# Get Account email
+
+DATA=$(ldapsearch $LDAP_S_OPTS uuid=$UUID | ldap_to_json | json -aH email account)
+ACC_EMAIL=$(echo $DATA | awk '{print $1}')
+
+if [ ! "$ACC_EMAIL" ]; then
+   echo "Acoount with UUID $UUID not found"
+   return 2
+fi
+
+ACCOUNT=$(echo $DATA | awk '{print $2}')
+
+if [ "$ACCOUNT" ]; then # Its a sub-user so stop
+   echo "UUID $UUID is a sub-user. Please provide an account UUID"
+   return
+fi
+
+REQUESTER=$(curl https://joyentcloud.zendesk.com/api/v2/tickets/${TID}.json \
+   -u "$NOTIFY_USER:$NOTIFY_PASSWORD" \
+   -X GET 2> /dev/null | json -aH ticket.requester_id )
+
+REQ_EMAIL=$(curl https://joyentcloud.zendesk.com/api/v2/users/${REQUESTER}.json \
+   -u "$NOTIFY_USER:$NOTIFY_PASSWORD" \
+   -X GET 2> /dev/null | json -aH user.email)
+
+{
+echo "--> Ticket ZD-$TID - Email: $REQ_EMAIL"
+echo "--> Account $UUID - Email: $ACC_EMAIL"
+} | column -t
+
+if [ "$ACC_EMAIL" = "$REQ_EMAIL" ]; then
+   echo "--> AUTHOR$(loc)ED - Ticket requester $REQ_EMAIL is Account owner"
+   return
+fi
+
+# Now we need Org details. If Org is missing then stop
+ORG=$(curl https://joyentcloud.zendesk.com/api/v2/users/search.json?query=email:$ACC_EMAIL \
+   -u "$NOTIFY_USER:$NOTIFY_PASSWORD" \
+   -X GET 2> /dev/null | json -aH users | json -a organization_id)
+
+if [ "$ORG" = "" -o "$ORG" = "null" ]; then
+   cat << !
+!!!!!!!!!!!!!!!!!!!!!
+
+NOT AUTHOR$(loc)ED - Requester is not account owner and Org record does not exist in Zendesk
+
+!!!!!!!!!!!!!!!!!!!!!
+!
+   return
+fi
+
+read TIER SDC NODE NAME <<< $(curl https://joyentcloud.zendesk.com/api/v2/organizations/${ORG}.json \
+   -u "$NOTIFY_USER:$NOTIFY_PASSWORD" \
+   -X GET 2> /dev/null | json -aH organization | json organization_fields.support_tier organization_fields.sdc_status organization_fields.node_js_core_support name)
+
+echo "--> Zendesk Org: $NAME"
+{
+echo SUPPORT-TIER SDC-STATUS NODE-SUPPORT
+echo $TIER $SDC $NODE
+
+} | column -t
+
+# Ticket Requester is not the account owner so we need to get the membership details
+
+# Is the requester a member of the Org
+
+ORG_REQ=$(curl https://joyentcloud.zendesk.com/api/v2/organizations/${ORG}/organization_memberships.json \
+   -u "$NOTIFY_USER:$NOTIFY_PASSWORD" \
+   -X GET 2> /dev/null | json -aH organization_memberships | json -a user_id | grep $REQUESTER)
+
+if [ "$ORG_REQ" = "$REQUESTER" ]; then
+   echo "--> AUTHOR$(loc)ED - Ticket requester $REQ_EMAIL is a member of Org '$NAME' in ZD"
+   return
+fi
+
+cat << !
+!!!!!!!!!!!!!!!!!!!!!
+
+NOT AUTHOR$(loc)ED - Email $REQ_EMAIL NOT AUTHOR$(loc)ED for Account $UUID ($ACC_EMAIL)
+
+!!!!!!!!!!!!!!!!!!!!!
+!
+} | to_zd $TID
+}
+
+
+
+
+put_tb_manta()
+{
+aud $@
+curl -k 'https://us-east.manta.joyent.com/joyentsup/stor/TOOLS/toolbox?algorithm=RSA-SHA256&expires=1794219319&keyId=%2FPeterG%2Fkeys%2F87%3A59%3A71%3A13%3A7e%3A58%3A11%3A82%3Aa4%3A56%3A02%3A02%3Acf%3A16%3A0d%3A1d&signature=ooGOkyeZZkXpprPW8SmWkQ1pn8%2B2ZXTfXAf4OEBULtfv5hzBilVlOxNI6fHoqdYGW3eOBbgIGIMKzl4Y1NFZRNRNuqk9Wkhg%2Bx96PFa6XpxGWlSf4L%2Fx7Ck2QHic%2FYuVJuEPCvAeMSAPyLhUWmnYuMGf71v2TZkzDcNKUK268Uk5clWwFn7w%2BqX2%2F88cZfNsqv6VofMM29me4jQZqsSiHoFuYtr0zlfZgf%2Fq960L7duYLiksKrZ5j8lYzrrqzGuz6uPDc%2BYG9hUuVbovoj2OP1TPvjVmDz7QCQG7dM8ooEAjm7vZVsWv%2Bs323rvLyiapt3JP2l7htGX9sfvIeLa0vA%3D%3D' -T toolbox
+
+}
+
+get_tb_manta()
+{
+#curl -k -o ${BASH_SOURCE}.latest 'https://us-east.manta.joyent.com/joyentsup/stor/TOOLS/toolbox?algorithm=RSA-SHA1&expires=1533126615&keyId=%2FPeterG%2Fkeys%2F82%3A4c%3A78%3A86%3A03%3A31%3A80%3Ad0%3Ad1%3A2d%3A2b%3Af1%3Ad5%3A83%3A6a%3A22&signature=Wo2GqZFtfXbYFJ%2FDbUQbKLgav34w6WPtBoK9yNo%2BB9PSFyuTrMKcVUZkx4YEGtT1jID1Rh0uBS8Y5E%2Bwc41WnYON8AaFEvZAhm6So2naSLWrKsVv6Smmgfb675tTw43nx146bmp3DVrSJgtvCNIq%2FsKSoZFtq%2B%2FG74Rf6dbs4kT3QYie%2BR7VmQQuh7%2FaNxmQsyMRnqwttNi4MhN%2BENzEJuR%2BQU6J4d%2Fjy0lpkla%2Bwzb0wyF4iKGT0L78Kc%2BTiEBIfxVPMO84rplH5LJE%2FipxfTDBj%2B81cxC3WTH3x5%2F%2F4fbNBfhydTvcV%2BdNyVRILGSPVox0rODFjAezsijrgttwRQ%3D%3D' > /dev/null 2>&1
+
+chmod 777 ${BASH_SOURCE}.latest
+
+CURR=$(head -1 $BASH_SOURCE | /usr/bin/cut -d'=' -f 2)
+NEW=$(head -1 ${BASH_SOURCE}.latest | /usr/bin/cut -d'=' -f 2)
+
+if [ "$CURR" != "$NEW" ]; then
+   echo "New Version $NEW available"
+   echo "Replacing Old version"
+   cp ${BASH_SOURCE}.latest $BASH_SOURCE
+   echo "Re-sourcing"
+   . $BASH_SOURCE
+else
+   ver
+fi
+}
+
+wdjf()
+#:- wdjf :dc :job_uuid |Print bunyan parsed job error message showing low level failure details
+{
+aud $@
+
+DC=$(valid_dc $1) || ( echo "Invalid DC name - Valid names are $AZS" && false ) || return
+JUUID=$2
+
+workflow $DC /jobs/$JUUID | json -aH chain_results | json -a error | grep -v "^$"
+workflow $DC /jobs/$JUUID | json -aH chain_results | json -a error.message | bunyan | grep -v "^$"
+
+}
+
+ncra ()
+#:- ncra :job_uuid |Show why a provison returned "No Compute Resources Available"
+{
+aud $@
+eval $(grep datacenter_name= /usbkey/config)
+
+[ "$1" = "" ] && echo "Usage: ncra :job_uuid" && return
+
+JUUID=$1
+
+read REQ_ID EXEC NAME CREATE <<< $(sdc-workflow /jobs/$JUUID | json -aH params.x-request-id execution name created_at)
+
+[ "$REQ_ID" = "" ] && echo "$JUUID is not a Job UUID in this DC ($datacenter_name)" && return
+[ "$EXEC" != "failed" ] && echo "$JUUID is not a Failed Job in this DC ($datacenter_name)" && return
+[ "$(echo $NAME | /usr/bin/cut -d"-" -f 1)" != "provision" ] && echo "$JUUID is not a Failed Provision Job in this DC ($datacenter_name)" && return
+
+ERROR="$(sdc-workflow /jobs/$JUUID | json -aH chain_results | json -aH error.message | tail -1)"
+[ "$ERROR" != "No compute resources available" ] && echo "$JUUID is not a Job that failed with 'No compute resources available' in this DC ($datacenter_name)" && return
+
+echo "--> Job $JUUID - $EXEC - $CREATE - 'No compute resources available'"
+
+# date munging
+
+YR=$(echo $CREATE | awk '{print(substr($0,1,4))}')
+MO=$(echo $CREATE | awk '{print(substr($0,6,2))}')
+DY=$(echo $CREATE | awk '{print(substr($0,9,2))}')
+HR=$(echo $CREATE | awk '{print(substr($0,12,2))}')
+
+# Figure out where the file is
+
+CNAPI=$(sdc-vmname cnapi)
+
+read CYR CMO CDY CHR <<< $(date "+%Y %m %d %H")
+read YR1 MO1 DY1 HR1 <<< $(zlogin $CNAPI "/opt/local/bin/date --date='${YR}-${MO}-${DY}T${HR}:00:00 UTC-1' '+%Y %m %d %H'")
+
+
+if [ "$YR$MO$DY$HR" = "$CYR$CMO$CDY$CHR" ]; then # Current log
+   zlogin $CNAPI ". .bash_profile;bunyan \`svcs -L cnapi\` -c 'this.snapshot && this.req_id == \"$REQ_ID\"' --strict -j | json -ga snapshot | base64 -d | gunzip | json -ga steps"
+elif zlogin $CNAPI "ls /var/log/sdc/upload/cnapi_${CNAPI}_${YR1}-${MO1}-${DY1}T${HR1}:00:00.log" 2> /dev/null ; then
+   zlogin $CNAPI ". .bash_profile;bunyan /var/log/sdc/upload/cnapi_${CNAPI}_${YR1}-${MO1}-${DY1}T${HR1}:00:00.log -c 'this.snapshot && this.req_id == \"$REQ_ID\"' --strict -j | json -ga snapshot | base64 -d | gunzip | json -ga steps"
+else
+   manta /admin/stor/logs/$datacenter_name/cnapi/$YR/$MO/$DY/$HR/$CNAPI.log -X GET | bunyan -c 'this.snapshot && this.req_id == "'$REQ_ID'"' --strict -j | json -ga snapshot | \
+           zlogin $CNAPI ". .bash_profile;base64 -d" | gunzip | json -ga steps
+fi > /var/tmp/ncra.$$.out
+
+tail -40 /var/tmp/ncra.$$.out
+
+echo Full log: /var/tmp/ncra.$$.out
+
+}
+
+#-------------
+designation ()
+#:- designation :job_uuid |Show why a provison landed on the CN
+{
+aud $@
+eval $(grep datacenter_name= /usbkey/config)
+
+[ "$1" = "" ] && echo "Usage: designation :job_uuid" && return
+
+JUUID=$1
+
+read REQ_ID EXEC NAME CREATE <<< $(sdc-workflow /jobs/$JUUID | json -aH params.x-request-id execution name created_at)
+
+[ "$REQ_ID" = "" ] && echo "$JUUID is not a Job UUID in this DC ($datacenter_name)" && return
+[ "$EXEC" != "success" ] && echo "$JUUID is not a succesful Job in this DC ($datacenter_name)" && return
+[ "$(echo $NAME | /usr/bin/cut -d"-" -f 1)" != "provision" ] && echo "$JUUID is not a succesful Provision Job in this DC ($datacenter_name)" && return
+
+echo "--> Job $JUUID - $EXEC - $CREATE "
+
+# date munging
+
+YR=$(echo $CREATE | awk '{print(substr($0,1,4))}')
+MO=$(echo $CREATE | awk '{print(substr($0,6,2))}')
+DY=$(echo $CREATE | awk '{print(substr($0,9,2))}')
+HR=$(echo $CREATE | awk '{print(substr($0,12,2))}')
+
+# Figure out where the file is
+
+CNAPI=$(sdc-vmname cnapi)
+
+read CYR CMO CDY CHR <<< $(date "+%Y %m %d %H")
+read YR1 MO1 DY1 HR1 <<< $(zlogin $CNAPI "/opt/local/bin/date --date='${YR}-${MO}-${DY}T${HR}:00:00 UTC-1' '+%Y %m %d %H'")
+
+
+if [ "$YR$MO$DY$HR" = "$CYR$CMO$CDY$CHR" ]; then # Current log
+   zlogin $CNAPI ". .bash_profile;bunyan \`svcs -L cnapi\` -c 'this.snapshot && this.req_id == \"$REQ_ID\"' --strict -j | json -ga snapshot | base64 -d | gunzip | json -ga steps"
+elif zlogin $CNAPI "ls /var/log/sdc/upload/cnapi_${CNAPI}_${YR1}-${MO1}-${DY1}T${HR1}:00:00.log" 2> /dev/null ; then
+   zlogin $CNAPI ". .bash_profile;bunyan /var/log/sdc/upload/cnapi_${CNAPI}_${YR1}-${MO1}-${DY1}T${HR1}:00:00.log -c 'this.snapshot && this.req_id == \"$REQ_ID\"' --strict -j | json -ga snapshot | base64 -d | gunzip | json -ga steps"
+else
+   manta /admin/stor/logs/$datacenter_name/cnapi/$YR/$MO/$DY/$HR/$CNAPI.log -X GET | bunyan -c 'this.snapshot && this.req_id == "'$REQ_ID'"' --strict -j | json -ga snapshot | \
+           zlogin $CNAPI ". .bash_profile;base64 -d" | gunzip | json -ga steps
+fi > /var/tmp/designation.$$.out
+
+tail -40 /var/tmp/designation.$$.out
+
+echo Full log: /var/tmp/designation.$$.out
+
+}
+
+#-------------
+
+loc ()
+{
+   LOC=$(echo $LANG | /usr/bin/cut -d. -f 1 | /usr/bin/cut -d_ -f2)
+   case $LOC in
+      US ) echo IZ ;;
+      GB ) echo IS ;;
+      *)   echo IZ ;;
+   esac
+}
+
+function manta {
+        local alg=rsa-sha256
+        local keyId=/joyentsup/keys/0e:72:b8:e1:10:ce:53:95:8e:d0:73:f9:2a:d2:b1:e1
+        local now=$(date -u "+%a, %d %h %Y %H:%M:%S GMT")
+        local sig=$(echo "date:" $now | \
+                    tr -d '\n' | \
+                    openssl dgst -sha256 -sign /home/admin/PeterG/.ssh/id_rsa | \
+                    openssl enc -e -a | tr -d '\n')
+
+        curl -sS https://us-east.manta.joyent.com"$@" -H "date: $now"  \
+            -H "Authorization: Signature keyId=\"$keyId\",algorithm=\"$alg\",signature=\"$sig\""
+}
+
+aud()
+{
+	echo $(date "+%Y%m%d %H%M%S")" : $CURR_USER : ${FUNCNAME[1]} $@" >> $(dirname $TOOLBOX)/.log/tb_$(date "+%Y%m%d").log
+}
+
+if [ $(who am i | /usr/bin/cut -d' ' -f 1) = "pgale" ]; then
+   shopt -s histappend
+   export HISTFILE=/home/admin/PeterG/.bash_history
+   export HISTFILESIZE=1000
+fi
+
+#[ "$(basename $TOOLBOX)" = "toolbox" ] && get_tb_manta
+
+imo() {
+#:- imo :dc :vm_uuid |Show image origin of a VM
+	DC=$(valid_dc $1) || ( echo "Invalid DC name - Valid names are $AZS" && false ) || return
+	if [ "$3" ]; then
+		uuid=$2
+		n=$3
+		read name origin <<<"$(imgapi $DC /images/$uuid | json -aH name origin)"
+		printf %${n}s
+		echo "$name ($uuid)"
+		[ "$origin" ] && imo $DC $origin $[$n+1]
+	else
+		vm=$2
+		image_uuid=$(vmapi $DC /vms/$vm | json -H image_uuid)
+		[ "$image_uuid" ] && imo $DC $image_uuid 0
+	fi
+}
+
+ps1() {
+#:- ps1 |set PS1 to show current user, VM etc
+export PS1='Login=[$_TB_LOGIN], VM=[$_TB_UUID - $_TB_ALIAS], SVR=[$_TB_SVR_HOST - $_TB_SVR_IP]\n[\u@\h \w]\$ '
+}
+
+over ()
+#:- over N |Adds a PD override from now for +N hours
+{
+aud $@
+
+if ! let HRS=$1 > /dev/null 2>&1 ; then
+	echo "ERROR! : Param must be a positive integer specifying number of hours to override"
+        return
+fi
+
+PD_OPTS="Accept:application/vnd.pagerduty+json;version=2"
+
+while true
+do
+	curl -s -X GET -H "$PD_OPTS" -H "$PD_AUTH" https://api.pagerduty.com/users | json -aH users | json -aHg -d: name email id time_zone > /var/tmp/over.$$
+
+	select FOO in $(cut -d: -f1 /var/tmp/over.$$ | sed 's/ /_/' )
+	do
+	:
+	done < /dev/null
+
+	while true
+	do
+		read -p "Override to be added for who (Number or Q) ?: " ANS
+
+		[ "$ANS" = "Q" ] && return
+
+		if ! let SEL=$ANS > /dev/null 2>&1 ; then
+			echo "Invalid reply"
+			continue
+		fi
+
+		NAME=$(head -$SEL /var/tmp/over.$$ | tail -1 | cut -d: -f1)
+		KEY=$(head -$SEL /var/tmp/over.$$ | tail -1 | cut -d: -f3)
+		LTZ=$(head -$SEL /var/tmp/over.$$ | tail -1 | cut -d: -f4)
+
+		echo "This will set an override for $NAME as follows:-"
+		{
+		  echo TZ START TIME END TIME
+		  for TZS in UTC Europe/London US/Eastern US/Central US/Mountain US/Pacific
+		  do
+		    echo $TZS "$(TZ=$TZS date +"%Y-%m-%d %H:%M")" "$(TZ=$TZS date --date="$(TZ=UTC-$HRS date)" +"%Y-%m-%d %H:00")"
+		  done
+		} | column -t
+
+		read -p "Continue (Y or Q) ?: " ANS
+		[ "$ANS" = "Q" ] && return
+		[ "$ANS" != "Y" ] && continue
+
+		START=$(TZ=UTC date +%Y-%m-%dT%H:00:00-00:00)
+		END=$(TZ=UTC-$HRS date +%Y-%m-%dT%H:00:00-00:00)
+
+		curl -s -X POST --header 'Content-Type: application/json' --header 'Accept: application/vnd.pagerduty+json;version=2' --header 'Authorization: Token token=kxzy_16QLpf1-995LbCT' \
+		-d '{
+			  "override": {
+			    "start": "'$START'",
+			    "end": "'$END'",
+			    "user": {
+			      "id": "'$KEY'",
+			      "type": "user_reference"
+			    }
+			  }
+			}' 'https://api.pagerduty.com/schedules/PL9A70D/overrides' | json -aH 
+
+		return
+   	done
+	return
+done
+}
+
+capacity()
+{
+cnapi $1  /servers?extras=capacity,sysinfo |\
+        json -aH uuid hostname unreserved_disk sysinfo."Virtual Network Interfaces"."sdc_underlay0"."Link Status" traits.internal |\
+	egrep -v "headnode|Manta Node" |\
+        awk '{  print $1,$2,$3/1000,$4
+                if ($3 > 0) {   TT+=$3/1024
+                                T[$4]+=$3/1024}}
+                END {   print "Total Disk available:",TT," GB"
+                        print "Total disk for fabrics",T["up"], "GB"}'
+}
