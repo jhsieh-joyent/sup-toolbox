@@ -1954,7 +1954,7 @@ do
 		} | column -t
 
 		read -p "Continue (Y or Q) ?: " ANS
-		ANS=$(echo $ANS | tr 'a-z' 'A-Z'
+		ANS=$(echo $ANS | tr 'a-z' 'A-Z')
 		[ "$ANS" = "Q" ] && return
 		[ "$ANS" != "Y" ] && continue
 
