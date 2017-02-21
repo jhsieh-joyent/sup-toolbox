@@ -932,6 +932,13 @@ replace: approved_for_provisioning
 approved_for_provisioning: false
 !
 
+ldapmodify $LDAP_OPTS << !
+dn: $dn
+changetype: modify
+replace: accountStatus
+accountStatus: disabled
+!
+
 ldapmodify $LDAP_OPTS -f /tmp/$$.ldif
 
 ldapsearch $LDAP_S_OPTS "(&(objectclass=sdcperson)(uuid=$UUID))"
