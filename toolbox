@@ -1,16 +1,8 @@
-TB_VERSION=4.4.6
+TB_VERSION=4.5.0
 TB_VERSION_NAME="It's Wednesday, this must be Devon"
-TB_VERSION_DATE="20161116"
+TB_VERSION_DATE="20170502"
 TB_RECENT_CHANGES="
-Replaced sdc-ldap/ufds with OpenLDAP client
-vm/vmi now shows Swap
-Moved creds to environment
-Added random element to disabler string
-fraud() speed up
-Added over() for PD overrides
-Added RAM to vms_by_pkg / fraud
-Added dates to cust()
-Big speed up for cust_vms(). You are welcome.
+Added net_usage() to list public networks and number of used and free IPs
 "
 if [ "$(echo $BASH_SOURCE | cut -c 1)" == "/" ]; then
    TOOLBOX=$BASH_SOURCE
@@ -278,10 +270,10 @@ export CUST=$UUID
 
 [ ! "$UUID" ] && echo "Usage: cust_nets UUID " && return
 
-{ echo DC NAME NIC_TAG SUBNET
+{ echo DC NAME UUID NIC_TAG SUBNET
 for dc in $AZS
 do
-   napi $dc /networks?owner_uuid=$CUST | json -aH name nic_tag subnet | sort | prefix $dc
+   napi $dc /networks?owner_uuid=$CUST | json -aH name uuid nic_tag subnet | sort | prefix $dc
 done
 } | column -t
 }
@@ -572,13 +564,13 @@ CN=${2:-}
 
 [ ! "$CN" -a "$DC" ] && echo "Usage: cn_vms west_1|sw_1|east_1|ams_1 UUID" && return
 
-{ echo "VM_UUID ALIAS OWNER_UUID LOGIN EMAIL"
-vmapi $DC /vms?query="(%26(server_uuid=$CN)(|(state=running)(state=stopped)))" | json -aH uuid owner_uuid alias | \
-while read UUID OWN ALIAS
+{ echo "VM_UUID IMAGE_UUID ALIAS OWNER_UUID LOGIN EMAIL"
+vmapi $DC /vms?query="(%26(server_uuid=$CN)(|(state=running)(state=stopped)))" | json -aH uuid image_uuid disks.0.image_uuid owner_uuid alias | \
+while read UUID IMAGE OWN ALIAS
 do
    CUST="`call_api $DC CAPI /customers/$OWN | json -aH login email`"
 
-   echo $UUID $ALIAS $OWN $CUST
+   echo $UUID $IMAGE $ALIAS $OWN $CUST
 done
 } | column -t
 }
@@ -781,7 +773,7 @@ VCPUs:    $_TB_VCPUS
 TAGS:     $_TB_TAGS
 IP1:      $_TB_IP1 `[ $_TB_P1 = "true" ] && echo "(Primary)"`
 IP2:      $_TB_IP2 `[ $_TB_P2 = "true" ] && echo "(Primary)"`
-VNC:      $_TB_VNC_HOST / $_TB_VNC_PORT
+VNC:      $_TB_VNC_HOST:$_TB_VNC_PORT
 ---------------------------------------
 !
 if [ "$QUICK" = "false" ] ; then
@@ -1224,18 +1216,38 @@ fi
 }
 
 pi()
-#:- pi [B]| Tabular list of PI's running [or Booting]
+#:- pi [-btr]| Tabular list of PI's running, -b boot PI, -r skip reserved, -t skip traited CN's (SSD amd STORAGE are included)
 {
 aud $@
 
 B=current_platform
-[ "$1" ] && B=boot_platform
+T=true
+R=""
+
+echo $1
+
+local OPTIND
+
+while getopts btr OPT
+do
+	case $OPT in 
+	b) B=boot_platform ;;
+	t) T=false ;;
+	r) R='?reserved=false' ;;
+	*) echo "nope"; return ;;
+	esac
+done
 
 # Get the PI Lists
 for DC in $AZS
 do
    DMP=$(call_api $DC SAPI /services?name=cnapi | json -aH metadata.ALLOC_FILTER_DOCKER_MIN_PLATFORM)
-   call_api $DC CNAPI /servers | json -aH $B | count > /var/tmp/pi.$$.$DC.1
+   if [[ "$T" = true ]]; then
+      call_api $DC CNAPI /servers | json -aH $B | count > /var/tmp/pi.$$.$DC.1
+   else
+      call_api $DC CNAPI /servers | json -c 'this.traits.ssd == true || this.traits.storage == true || !Object.keys(traits).length' | json -c 'this.traits.internal == null' |\
+		json -aH $B | count > /var/tmp/pi.$$.$DC.1
+   fi
    sed 's/.* /TOTALS /' /var/tmp/pi.$$.$DC.1 | sum >> /var/tmp/pi.$$.$DC.1
    ex /var/tmp/pi.$$.$DC.1 << !
 /$DMP/s/$/*/
@@ -1929,7 +1941,7 @@ PD_OPTS="Accept:application/vnd.pagerduty+json;version=2"
 
 while true
 do
-	curl -s -X GET -H "$PD_OPTS" -H "$PD_AUTH" https://api.pagerduty.com/users | json -aH users | json -aHg -d: name email id time_zone > /var/tmp/over.$$
+	curl -s -X GET -H "$PD_OPTS" -H "$PD_AUTH" https://api.pagerduty.com/users?limit=100 | json -aH users | json -aHg -d: name email id time_zone > /var/tmp/over.$$
 
 	select FOO in $(cut -d: -f1 /var/tmp/over.$$ | sed 's/ /_/' )
 	do
@@ -1996,4 +2008,85 @@ cnapi $1  /servers?extras=capacity,sysinfo |\
                                 T[$4]+=$3/1024}}
                 END {   print "Total Disk available:",TT," GB"
                         print "Total disk for fabrics",T["up"], "GB"}'
+}
+
+
+net_usage()
+#:- net_usage DC [NET_UUID] |Displays the free and used IPs for all public networks on the given network
+{
+DC=$(valid_dc $1) || ( echo "Invalid DC name - Valid names are $AZS" && false ) || return
+DC=$1
+NETS=$2
+
+if [[ -z "$NETS" ]]; then
+	NETS=$(napi $DC "/networks?fabric=false" | json -c 'this.owner_uuids == null' | json -aH uuid)
+fi
+
+{
+echo UUID NAME IPS USED FREE %FREE
+for NET in $NETS
+do
+
+NETJSON=$(napi $DC /networks/$NET -f | json -H)
+if [[ -z "$NETJSON" ]]; then
+	echo "network $NET not found"
+	exit 1
+fi
+
+NAME=$(echo $NETJSON | json -a name)
+ST=$(echo $NETJSON | json -aH provision_start_ip | awk -F . '{print ($1*256^3)+($2*256^2)+($3*256)+$4}')
+EN=$(echo $NETJSON | json -aH provision_end_ip | awk -F . '{print ($1*256^3)+($2*256^2)+($3*256)+$4}')
+
+IPS=$(( $EN - $ST + 1))
+
+# Count Used
+
+OFF=0
+LIM=1000
+
+USED=$(while [[ $OFF -le $IPS ]]
+	do
+		napi $DC "/networks/$NET/ips?limit=$LIM&offset=$OFF"
+		OFF=$(( $OFF + $LIM ))
+	done | grep '"free":' | grep -c false )
+
+FREE=$(( $IPS - $USED ))
+PCTFREE=$(( $FREE * 100 / $IPS ))
+
+echo $NET $NAME $IPS $USED $FREE $PCTFREE%
+
+done
+} | column -t
+
+}
+
+
+pi_vms()
+#:- pi_vms PI |list the VMs on CN's with the given PI (Reboot analysis stuff)
+{
+
+
+PI=$1
+
+[[ ! "$PI" ]] && echo "No PI" && return
+
+for DC in $AZS
+do
+
+CNS=$(cnapi $DC /servers | json -c 'this.current_platform == "'$PI'"'| json -aH uuid)
+
+{
+	[[ "$CNS" ]] && echo PI DC CN VM LOGIN EMAIL
+	for CN in $CNS
+	do
+		echo $PI $DC $CN
+		vmapi $DC /vms?query="(%26(server_uuid=$CN)(|(state=running)(state=stopped)))" | json -aH alias owner_uuid |\
+		while read ALIAS OWNER
+		do
+			echo "$PI $DC - $ALIAS $(call_api $UFDS_MASTER CAPI /customers/$OWNER | json -aH login email)"
+		done
+	done
+} | column -t
+
+done
 }
