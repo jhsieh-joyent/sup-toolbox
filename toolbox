@@ -2104,6 +2104,8 @@ new_ip=$4
 [ -z "$vm_uuid" -o -z "$old_ip" -o -z "$new_ip" ] && echo "ip_swap DC VM_UUID old_IP new_IP" && return
 DC=$(valid_dc $1) || ( echo "Invalid DC name - Valid names are $AZS" && false ) || return
 
+owner_uuid=$(call_api $DC VMAPI /vms/$vm_uuid | json -aH owner_uuid)
+
 call_api $DC VMAPI /vms/$vm_uuid | json -H nics | json -ac "this.ip=='$old_ip'" interface mac vlan_id nic_tag network_uuid primary | while read interface mac vlan_id nic_tag network_uuid primary; do
 	free=$(call_api $DC NAPI /networks/$network_uuid/ips/$new_ip | json -aH free)
 	if [ "x$free" = "xfalse" ]; then
