@@ -2096,6 +2096,7 @@ done
 ip_swap()
 #:- ip_swap DC VM_UUID old_IP new_IP |change the IP on a VM
 {
+aud $@
 dc=$1
 vm_uuid=$2
 old_ip=$3
