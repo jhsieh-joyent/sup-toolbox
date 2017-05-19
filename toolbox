@@ -444,23 +444,34 @@ echo "---------------------------------------------"
 
 QUERY="(%26(owner_uuid=$UUID)(|(state=running)(state=stopped)))"
 
+{
 echo "DC       VMs RAM(gb)"
 echo "------- ---- -------"
 for dc in $AZS
 do
-  echo "DC $dc"
-  call_api $dc VMAPI "/vms?query=$QUERY" | json -aH ram
+        echo "DC $dc"
+        local OFF=0
+        local API_DATA
+        while true
+        do
+                API_DATA=$(call_api $dc VMAPI "/vms?query=$QUERY&offset=${OFF}&limit=1000" | json -aH ram)
+                [ ! "$API_DATA" ] && break
+                echo "$API_DATA"
+                OFF=$(( $OFF + 1000 ))
+        done
+
 done | \
       nawk 'BEGIN {RT=0;VT=0}
-	   {if ( $1 == "DC" ) {TDC=$2}
+           {if ( $1 == "DC" ) {TDC=$2}
            else {V[TDC]+=1;R[TDC]+=$1;VT+=1;RT+=$1}}
            END {for (dc in V)
-                    {printf("%-7s%5s%8s\n",dc,V[dc],int(R[dc]/1024))}
-                     printf("%-7s%5s%8s\n","=======","====","=======")
-                     printf("%-7s%5s%8s\n","TOTAL",VT,int(RT/1024))
-                     printf("%-7s%5s%8s\n","=======","====","=======")
+                    {print(dc,V[dc],int(R[dc]/1024))}
+                     print("=======","====","=======")
+                     print("TOTAL",VT,int(RT/1024))
+                     print("=======","====","=======")
                }'
 
+} | column -t
 echo "---------------------------------------------"
 }
 
