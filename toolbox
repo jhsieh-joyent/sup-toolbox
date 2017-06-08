@@ -2108,78 +2108,123 @@ ip_swap()
 #:- ip_swap DC VM_UUID old_IP new_IP |change the IP on a VM
 {
 aud $@
-dc=$1
-vm_uuid=$2
-old_ip=$3
-new_ip=$4
+VM_UUID=$2
+OLD_IP=$3
+NEW_IP=$4
 
-[ -z "$vm_uuid" -o -z "$old_ip" -o -z "$new_ip" ] && echo "ip_swap DC VM_UUID old_IP new_IP" && return
+[ -z "$VM_UUID" -o -z "$OLD_IP" -o -z "$NEW_IP" ] && echo "ip_swap DC VM_UUID old_IP new_IP" && return
 DC=$(valid_dc $1) || ( echo "Invalid DC name - Valid names are $AZS" && false ) || return
 
-owner_uuid=$(call_api $DC VMAPI /vms/$vm_uuid | json -aH owner_uuid)
-cn_uuid=$(call_api $DC VMAPI /vms/$vm_uuid | json -aH server_uuid)
+OWNER_UUID=$(call_api $DC VMAPI /vms/$VM_UUID | json -aH owner_uuid)
+CN_UUID=$(call_api $DC VMAPI /vms/$VM_UUID | json -aH server_uuid)
 
-call_api $DC VMAPI /vms/$vm_uuid | json -H nics | json -ac "this.ip=='$old_ip'" interface mac vlan_id nic_tag network_uuid primary | while read interface mac vlan_id nic_tag network_uuid primary; do
-	free=$(call_api $DC NAPI /networks/$network_uuid/ips/$new_ip | json -aH free)
-	if [ "x$free" = "xfalse" ]; then
-		echo "IP $new_ip is unavailable."
-		exit 1
+call_api $DC VMAPI /vms/$VM_UUID | json -H nics | json -ac "this.ip=='$OLD_IP'" interface mac vlan_id nic_tag network_uuid primary | while read INTERFACE MAC VLAN_ID NIC_TAG NETWORK_UUID PRIMARY; do
+	# Is the IP actually free?
+	FREE=$(call_api $DC NAPI /networks/$NETWORK_UUID/ips/$NEW_IP | json -aH free)
+	if [ "$FREE" = "false" ]; then
+		echo "IP $NEW_IP is unavailable."
+		return 1
 	fi
-	[ "x$primary" = x ] && primary=false
-	spoofing=$(call_api $DC VMAPI /vms/$vm_uuid | json -H nics | json -ac "this.ip=='$old_ip'" allow_ip_spoofing)
-	if [ "x$spoofing" != xtrue ]; then
-		spoofing=false
+
+	# Is it the Primary IP
+	[ "x$PRIMARY" = "x" ] && PRIMARY=false
+
+	# Is Spoofing enabled now
+	SPOOFING=$(call_api $DC VMAPI /vms/$VM_UUID | json -H nics | json -ac "this.ip=='$OLD_IP'" allow_ip_spoofing)
+	if [ "x$SPOOFING" != "xtrue" ]; then
+		SPOOFING=false
 	fi
+
+	# Reserve the IP
 	echo Reserving IP
-	call_api $DC NAPI /networks/$network_uuid/ips/$new_ip -X PUT --data '{"reserved":true}'
-	echo Shutting down VM
-	call_api $DC VMAPI /vms/$vm_uuid?action=stop -X POST 
-	while [ "x$(call_api $DC VMAPI /vms/$vm_uuid | json -aH state )" != xstopped ]; do
-		echo waiting for VM to shut down
-		sleep 1
-	done
-	echo Deleting NIC
-	call_api $DC NAPI /nics/$mac -X DELETE
-	call_api $DC VMAPI /vms/$vm_uuid?action=remove_nics --data '{"macs":["'$mac'"]}' -X POST
-	while call_api $DC NAPI /nics/$mac | json -aH mac | grep -q : ; do
-		echo waiting for NIC to disappear
-		sleep 1
-	done
-	sleep 10
-	echo Creating NIC
-	call_api $DC NAPI /nics -X POST --data '{
-		"mac": "'$mac'",
-		"interface": "'$interface'",
-		"primary": '$primary',
-		"belongs_to_type": "zone",
-		"belongs_to_uuid": "'$vm_uuid'",
-		"owner_uuid": "'$owner_uuid'",
-		"ip": "'$new_ip'",
-		"nic_tag": "'$nic_tag'",
-		"vlan_id": "'$vlan_id'",
-		"network_uuid": "'$network_uuid'",
-		"cn_uuid": "'$cn_uuid'",
-		"allow_ip_spoofing": '$spoofing'
-	}'
-	t=0
-	while [ -z $(call_api $DC NAPI /nics/$mac | json -aH mac) ]; do
-		t=$[$t+1]
-		if [ $t -gt 30 ]; then
-			echo NIC never created
-			exit 1
+	call_api $DC NAPI /networks/$network_uuid/ips/$ip -X PUT -d '{"reserved": true}' >/dev/null
+
+	# Avoid race by checking the IP is still unused
+	BTU=$(call_api $DC NAPI /networks/$NETWORK_UUID/ips/$NEW_IP | json -aH belongs_to_uuid)
+	if [ "x$BTU" != x ]; then
+		echo "Reservation failed due to race condition. IP is already assigned to VM $BTU"
+		return 1
+	fi
+
+	# Stop the VM, if necessary
+	if [ "$(call_api $DC VMAPI /vms/$VM_UUID | json -aH state)" = running ]; then
+		echo Shutting down VM
+		job_uuid=$(call_api $DC VMAPI /vms/$VM_UUID?action=stop -X POST | json -aH job_uuid)
+		while :; do
+			job_status=$(call_api $DC WORKFLOW /jobs/$job_uuid | json -aH execution)
+			[ "x$job_status" = "xsucceeded" ] && break
+			if [ "x$job_status" = "xfailed" ]; then
+				echo VM stop failed
+				return 1
+			fi
+			echo "Waiting for VM to stop ($job_status)"
+			sleep 1
+		done
+	else
+		echo VM already stopped
+	fi
+
+	# Delete the NIC from VMAPI, which deletes it from NAPI
+	job_uuid=$(call_api $DC VMAPI '/vms/'$VM_UUID'?action=remove_nics' -d '{ "macs": [ "'$MAC'" ] }' -X POST | json -aH job_uuid)
+	while :; do
+		job_status=$(call_api $DC WORKFLOW /jobs/$job_uuid | json -aH execution)
+		[ "x$job_status" = "xsucceeded" ] && break
+		if [ "x$job_status" = "xfailed" ]; then
+			echo Remove NIC workflow failed
+			return 1
 		fi
+			echo "Waiting for NIC to disappear ($job_status)"
 		sleep 1
-		echo waiting for NIC to appear
 	done
+
+	sleep 5
+	echo Creating NIC
+	call_api $DC NAPI /nics -X POST -d '{
+		"mac": "'$MAC'",
+		"interface": "'$INTERFACE'",
+		"primary": '$PRIMARY',
+		"belongs_to_type": "zone",
+		"belongs_to_uuid": "'$VM_UUID'",
+		"owner_uuid": "'$OWNER_UUID'",
+		"ip": "'$NEW_IP'",
+		"nic_tag": "'$NIC_TAG'",
+		"vlan_id": "'$VLAN_ID'",
+		"network_uuid": "'$NETWORK_UUID'",
+		"cn_uuid": "'$CN_UUID'",
+		"allow_ip_spoofing": '$SPOOFING'
+	}' >/dev/null
+	t=0
+	while [ -z "$(call_api $DC NAPI /nics/$MAC | json -aH mac)" ]; do
+		sleep 1
+		t=$[$t+1]
+		if [ $t -gt 15 ]; then
+			echo NIC never created
+			return 1
+		fi
+		echo Waiting for NIC to appear
+	done
+
 	echo Adding NIC
-	call_api $DC VMAPI /vms/$vm_uuid?action=add_nics --data '{"macs":"'$mac'"}'
+	job_uuid=$(call_api $DC VMAPI /vms/$VM_UUID?action=add_nics -X POST -d '{"macs":"'$MAC'"}' | json -aH job_uuid)
+	while :; do
+		job_status=$(call_api $DC WORKFLOW /jobs/$job_uuid | json -aH execution)
+		[ "x$job_status" = "xsucceeded" ] && break
+		if [ "x$job_status" = "xfailed" ]; then
+			echo Add NIC workflow failed
+			return 1
+		fi
+		echo "Waiting for NIC to be added ($job_status)"
+		sleep 1
+	done
 	echo Unreserving IP
-	call_api $DC NAPI /networks/$network_uuid/ips/$new_ip -X PUT --data '{"reserved":false}'
+	call_api $DC NAPI /networks/$NETWORK_UUID/ips/$NEW_IP -X PUT --data '{"reserved":false}' >/dev/null
+
 	echo Starting VM
-	call_api $DC VMAPI /vms/$vm_uuid?action=start -X POST 
-	while [ "x$(call_api $DC VMAPI /vms/$vm_uuid | json -aH state )" != xrunning ]; do
+	call_api $DC VMAPI /vms/$VM_UUID?action=start -X POST >/dev/null
+	while [ "$(call_api $DC VMAPI /vms/$VM_UUID | json -aH state )" != "running" ]; do
 		echo waiting for VM to start
 		sleep 1
 	done
 done
+return 0
 }
