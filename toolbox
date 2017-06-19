@@ -165,7 +165,12 @@ email_search ()
 #:- email_search :email_address |List accounts matching the email address. Accepets * as wild card
 {
 aud $@
-   for UUID in `ldapsearch $LDAP_S_OPTS "(&(objectclass=sdcperson)(email=$1))" | ldap_to_json | json -aHg uuid`
+   if echo $1 | grep -q '*'; then
+      search="email=$1"
+   else
+      search="email:caseIgnoreMatch:=$1"
+   fi
+   for UUID in `ldapsearch $LDAP_S_OPTS "(&(objectclass=sdcperson)($search))" | ldap_to_json | json -aHg uuid`
    do
    ldapsearch $LDAP_S_OPTS "(&(objectclass=sdcperson)(uuid=$UUID))" | ldap_to_json | json -aHg uuid login email approved
    done | tee /var/tmp/.$$.ems | column -t
@@ -2227,4 +2232,16 @@ call_api $DC VMAPI /vms/$VM_UUID | json -H nics | json -ac "this.ip=='$OLD_IP'" 
 	done
 done
 return 0
+}
+urlencode() {
+    # urlencode <string>
+
+    local length="${#1}"
+    for (( i = 0; i < length; i++ )); do
+        local c="${1:i:1}"
+        case $c in
+            [a-zA-Z0-9.~_-]) printf "$c" ;;
+            *) printf '%%%02X' "'$c"
+        esac
+    done
 }
