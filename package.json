@@ -1,6 +1,6 @@
 {
   "name": "toolbox",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Peter Gale's sourceable toolbox functions.",
   "repository": "git@github.com:joyent/sup-toolbox.git",
   "bin": {
