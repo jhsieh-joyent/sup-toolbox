@@ -93,10 +93,12 @@ cd sup-toolbox
 mget -O /joyentsup/stor/TOOLS/toolbox
 ```
 
-Review changes in the toolbox script using ``git diff`` so that you can create a commit message describing the recent changes then ``git add``, ``git commit``, and ``git push``.
+Review changes in the toolbox script using ``git diff`` so that you can create a commit message describing the recent changes.  After reviewing the changes update the "version" field in package.json then ``git add``, ``git commit``, and ``git push``.
 
 ```
 git diff toolbox
+vim package.json
+git add package.json
 git add toolbox
 git commit -m "Synced from Manta: Replaced sdc-ldap/ufds with OpenLDAP client"
 git push origin master

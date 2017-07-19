@@ -1,13 +1,12 @@
 {
   "name": "toolbox",
-  "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
-  "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+  "version": "1.0.1",
+  "description": "Peter Gale's sourceable toolbox functions.",
+  "repository": "git@github.com:joyent/sup-toolbox.git",
+  "bin": {
+    "toolbox": "./toolbox"
   },
-  "author": "",
-  "license": "ISC",
+  "private": true,
   "dependencies": {
     "sdc": "https://github.com/joyent/sdc-sdc.git#f53cf2d"
   }
