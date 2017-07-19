@@ -93,13 +93,15 @@ cd sup-toolbox
 mget -O /joyentsup/stor/TOOLS/toolbox
 ```
 
-Review changes in the toolbox script using ``git diff`` so that you can create a commit message describing the recent changes.  After reviewing the changes update the "version" field in package.json then ``git add``, ``git commit``, and ``git push``.
+Review changes in the toolbox script using ``git diff`` so that you can create a commit message describing the recent changes, then ``git add``, ``git commit``, update the version in package.json with ``npm version``, and then ``git push``.
 
 ```
 git diff toolbox
-vim package.json
-git add package.json
 git add toolbox
 git commit -m "Synced from Manta: Replaced sdc-ldap/ufds with OpenLDAP client"
+npm version minor
 git push origin master
 ```
+
+Note: You can use ``npm version major|minor|patch`` to update the version number in package.json. You can also update the version manually.
+
