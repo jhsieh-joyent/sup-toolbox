@@ -1,9 +1,11 @@
-TB_VERSION=4.5.1
+[ $BASH_SOURCE[0] != /opt/local/lib/node_modules/toolbox/toolbox ] && echo Please source the toolbox with the tb alias. && return
+TB_VERSION=4.5.2
 TB_VERSION_NAME="It's Thursday, this must be Leatherhead"
-TB_VERSION_DATE="20170518"
+TB_VERSION_DATE="20171115"
 TB_RECENT_CHANGES="
 Added net_usage() to list public networks and number of used and free IPs
 Added ip_swap() to change an IP on a VM
+Fixed a bug in to_zd() to cope with embedded double quotes
 "
 if [ "$(echo $BASH_SOURCE | cut -c 1)" == "/" ]; then
    TOOLBOX=$BASH_SOURCE
@@ -1518,6 +1520,7 @@ if [ ! "$2" = "t" ]; then
 fi
 
 COMMENT=$(echo $COMMENT | sed 's/\\n~~~\\n~~~\\n//g')
+COMMENT=$(echo $COMMENT | sed 's/"/\\"/g')
 
 cat << ! >> /var/tmp/$$.to_zd
          "body": "$COMMENT"
