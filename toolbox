@@ -1,4 +1,4 @@
-[ $BASH_SOURCE[0] != /opt/local/lib/node_modules/toolbox/toolbox ] && echo Please source the toolbox with the tb alias. && return
+[ ${BASH_SOURCE[0]} != /opt/local/lib/node_modules/toolbox/toolbox ] && echo Please source the toolbox with the tb alias. && return
 TB_VERSION=4.5.2
 TB_VERSION_NAME="It's Thursday, this must be Leatherhead"
 TB_VERSION_DATE="20171115"
