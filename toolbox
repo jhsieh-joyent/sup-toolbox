@@ -867,7 +867,6 @@ Updated:   $(date --date=@$(echo $DATA | /usr/bin/cut -d^ -f10 | cut -c1-10))
 Approved:  $(echo $DATA | /usr/bin/cut -d^ -f8)
 
 AdminUI:   https://$ADMINUI_URL/users/$UUID
-Supmon:    https://supmon.joyent.com/m/search-owner.html?owner=$UUID
 !
 
 }
