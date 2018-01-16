@@ -1113,7 +1113,7 @@ aud $@
       echo "Need a UUID or email" && return
    fi
 
-   DCS="eu-ams-1 us-east-1 us-east-2 us-east-3 us-sw-1 us-west-1"
+   DCS="`ldapsearch $LDAP_S_OPTS -b o=smartdc objectclass=datacenter datacenter | grep ^datacenter | cut -f 2 -d \" \" | sort | uniq`"
 
    c=$(ldapsearch $LDAP_S_OPTS -b "UUID=${UUID:-$_TB_OWNER}, ou=users, o=smartdc" objectclass=capilimit | grep limit: | wc -l)
    if [ $c != 0 ]; then
@@ -1123,8 +1123,13 @@ aud $@
    else
         for dc in $DCS
         do
-            printf "dn: dclimit=$dc, uuid=$UUID, ou=users, o=smartdc\ndatacenter: $dc\nlimit: {\"check\":\"os\",\"os\":\"any\",\"by\":\"ram\",\"value\":\"32768\"}\nobjectclass: capilimit\n" | ldapadd $LDAP_OPTS
-            sleep 5
+		cat <<-! >&1 | ldapadd $LDAP_OPTS
+		dn: dclimit=$dc, uuid=$UUID, ou=users, o=smartdc
+		datacenter: $dc
+		limit: {"check":"os","os":"any","by":"ram","value":"32768"}
+		objectclass: capilimit
+		!
+       		sleep 5
         done
 	echo "Checking for newly created limits"
 	echo "`limits ${UUID:-$_TB_OWNER}`"
